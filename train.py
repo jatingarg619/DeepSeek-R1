@@ -12,6 +12,54 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 
+# Test prompts for generation
+TEST_PROMPTS = [
+    "Explain the concept of quantum entanglement in simple terms:",
+    "Write a short story about a time traveler who:",
+    "Here's a recipe for a delicious vegetarian dish:",
+    "The most fascinating discovery in astronomy was:",
+    "The future of artificial intelligence will likely involve:"
+]
+
+def generate_text(
+    model,
+    tokenizer,
+    prompt,
+    max_length=100,
+    temperature=0.8,
+    device='cuda'
+):
+    model.eval()
+    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids,
+            max_length=max_length,
+            temperature=temperature
+        )
+    
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    model.train()
+    return generated_text
+
+def test_generation(model, tokenizer, device, log_file):
+    log_file.write("\n" + "="*50 + "\nTest Generations\n" + "="*50 + "\n")
+    
+    for i, prompt in enumerate(TEST_PROMPTS, 1):
+        log_file.write(f"\nPrompt {i}: {prompt}\n")
+        generated_text = generate_text(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            device=device
+        )
+        log_file.write(f"Generated text:\n{generated_text}\n")
+        log_file.write("-"*50 + "\n")
+    
+    log_file.write("\n" + "="*50 + "\n")
+    log_file.flush()
+
 def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
     def tokenize_function(examples):
         # Concatenate all texts and add EOS token
@@ -64,6 +112,12 @@ def train(
     save_dir: str = "checkpoints"
 ):
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs("logs/training", exist_ok=True)  # Create logs directory
+    
+    # Open log file
+    log_file = open("logs/training/training_log.txt", "a")
+    log_file.write("\n" + "="*50 + "\nNew Training Run\n" + "="*50 + "\n")
+    
     model.train()
     criterion = nn.CrossEntropyLoss()
     
@@ -129,14 +183,19 @@ def train(
             })
             progress_bar.update(1)
             
-            # Print detailed stats every 100 steps
+            # Print and log detailed stats every 100 steps
             if global_step % 100 == 0:
-                print(f"\nStep {global_step}")
-                print(f"Average Loss: {avg_loss:.4f}")
-                print(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
-                print("-" * 50)
+                log_message = (
+                    f"\nStep {global_step}\n"
+                    f"Average Loss: {avg_loss:.4f}\n"
+                    f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
+                    + "-" * 50
+                )
+                print(log_message)
+                log_file.write(log_message + "\n")
+                log_file.flush()  # Ensure logs are written immediately
             
-            # Save checkpoint
+            # Save checkpoint, log, and generate test outputs
             if global_step % config['save_steps'] == 0:
                 checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
                 torch.save({
@@ -146,7 +205,19 @@ def train(
                     'scheduler_state_dict': scheduler.state_dict(),
                     'loss': avg_loss,
                 }, checkpoint_path)
-                print(f"\nCheckpoint saved: {checkpoint_path}")
+                checkpoint_message = f"\nCheckpoint saved: {checkpoint_path}"
+                print(checkpoint_message)
+                log_file.write(checkpoint_message + "\n")
+                
+                # Generate test outputs
+                print("\nGenerating test outputs...")
+                test_generation(model, tokenizer, device, log_file)
+                print("Test outputs generated and logged")
+                
+                log_file.flush()
+
+    # Close log file
+    log_file.close()
 
 def main():
     # Training configuration
@@ -155,7 +226,7 @@ def main():
         'gradient_accumulation_steps': 16,  # Effective batch size = 32
         'learning_rate': 1e-4,
         'weight_decay': 0.01,
-        'max_steps': 50000,
+        'max_steps': 10000,  # Changed from 11000 to 10000
         'warmup_steps': 2000,
         'save_steps': 1000,
         'seed': 42
