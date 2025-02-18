@@ -87,6 +87,9 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
         # Convert attention mask to boolean
         attention_mask = attention_mask.to(torch.bool)
         
+        # Replace padding token in labels with -100 to ignore in loss computation
+        labels = torch.where(attention_mask, labels, torch.tensor(-100))
+        
         return {
             'input_ids': input_ids,
             'labels': labels,
@@ -352,16 +355,17 @@ def train(
 def main():
     # Training configuration
     config = {
-        'batch_size': 1,              # Reduced from 2
-        'gradient_accumulation_steps': 32,  # Increased from 16
-        'learning_rate': 1e-5,        # Reduced from 5e-5
-        'weight_decay': 0.01,         # Reduced from 0.1
+        'batch_size': 1,
+        'gradient_accumulation_steps': 32,
+        'learning_rate': 1e-5,
+        'weight_decay': 0.01,
         'max_steps': 10000,
         'warmup_steps': 2000,
         'save_steps': 1000,
         'seed': 42,
-        'max_grad_norm': 0.1,         # Reduced from 0.5 for tighter gradient clipping
-        'resume_from': 0
+        'max_grad_norm': 0.1,
+        'resume_from': 0,
+        'block_size': 512  # Reduced from 2048 for better stability
     }
     
     # Check for existing checkpoints
@@ -392,12 +396,13 @@ def main():
     
     # Initialize model config with adjusted parameters
     model_config = DeepSeekConfig()
-    model_config.initializer_range = 0.005  # Further reduced from 0.01
-    model_config.hidden_size = 384          # Reduced from 576 for stability
-    model_config.intermediate_size = 1024   # Reduced from 1536
-    model_config.num_attention_heads = 6    # Reduced from 9
-    model_config.num_key_value_heads = 2    # Reduced from 3
-    model_config.num_hidden_layers = 20     # Reduced from 30
+    model_config.initializer_range = 0.005
+    model_config.hidden_size = 384
+    model_config.intermediate_size = 1024
+    model_config.num_attention_heads = 6
+    model_config.num_key_value_heads = 2
+    model_config.num_hidden_layers = 20
+    model_config.max_position_embeddings = config['block_size']  # Match block size
     
     # Load tokenizer - Using SmolLM2 tokenizer
     print("\nLoading tokenizer...")
@@ -437,27 +442,37 @@ def main():
     
     print("\nDataset features:", dataset.features)
     
-    # Create training dataset
+    # Create training dataset with reduced block size
     print("\nPreparing dataset...")
     train_dataset = create_dataloader(
         dataset,
         tokenizer,
         batch_size=config['batch_size'],
-        block_size=model_config.max_position_embeddings
+        block_size=config['block_size']  # Use smaller block size
     )
     
     # Initialize model
     print("\nInitializing model...")
     model = DeepSeekModel(model_config).to(device)
+    
+    # Initialize model weights with smaller range
+    def init_weights(module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=model_config.initializer_range)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+    
+    model.apply(init_weights)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Initialize optimizer with adjusted parameters
+    # Initialize optimizer with gradient clipping
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config['learning_rate'],
         weight_decay=config['weight_decay'],
         betas=(0.9, 0.95),
-        eps=1e-8  # Increased epsilon for numerical stability
+        eps=1e-8,
+        foreach=True  # Enable fused optimizer operations
     )
     
     # Initialize learning rate scheduler with longer warmup
@@ -469,10 +484,10 @@ def main():
     
     # Initialize gradient scaler with more conservative settings
     scaler = GradScaler(
-        init_scale=2**10,        # Start with smaller scale
-        growth_factor=1.5,       # More conservative growth
-        backoff_factor=0.5,      # More aggressive backoff
-        growth_interval=100,     # Increase scale less frequently
+        init_scale=2**8,        # Even smaller initial scale
+        growth_factor=1.2,      # More conservative growth
+        backoff_factor=0.5,
+        growth_interval=200,    # Less frequent scale increases
         enabled=True
     )
     
