@@ -319,15 +319,15 @@ def train(
 def main():
     # Training configuration
     config = {
-        'batch_size': 2,
-        'gradient_accumulation_steps': 16,
-        'learning_rate': 5e-5,
-        'weight_decay': 0.1,
+        'batch_size': 1,              # Reduced from 2
+        'gradient_accumulation_steps': 32,  # Increased from 16
+        'learning_rate': 1e-5,        # Reduced from 5e-5
+        'weight_decay': 0.01,         # Reduced from 0.1
         'max_steps': 10000,
         'warmup_steps': 2000,
         'save_steps': 1000,
         'seed': 42,
-        'max_grad_norm': 0.5,
+        'max_grad_norm': 0.1,         # Reduced from 0.5 for tighter gradient clipping
         'resume_from': 0
     }
     
@@ -359,7 +359,12 @@ def main():
     
     # Initialize model config with adjusted parameters
     model_config = DeepSeekConfig()
-    model_config.initializer_range = 0.01  # Reduced from 0.02
+    model_config.initializer_range = 0.005  # Further reduced from 0.01
+    model_config.hidden_size = 384          # Reduced from 576 for stability
+    model_config.intermediate_size = 1024   # Reduced from 1536
+    model_config.num_attention_heads = 6    # Reduced from 9
+    model_config.num_key_value_heads = 2    # Reduced from 3
+    model_config.num_hidden_layers = 20     # Reduced from 30
     
     # Load tokenizer - Using SmolLM2 tokenizer
     print("\nLoading tokenizer...")
@@ -413,23 +418,30 @@ def main():
     model = DeepSeekModel(model_config).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Initialize optimizer
+    # Initialize optimizer with adjusted parameters
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config['learning_rate'],
         weight_decay=config['weight_decay'],
-        betas=(0.9, 0.95)
+        betas=(0.9, 0.95),
+        eps=1e-8  # Increased epsilon for numerical stability
     )
     
-    # Initialize learning rate scheduler
+    # Initialize learning rate scheduler with longer warmup
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config['warmup_steps'],
         num_training_steps=config['max_steps']
     )
     
-    # Initialize gradient scaler for mixed precision training
-    scaler = GradScaler()
+    # Initialize gradient scaler with more conservative settings
+    scaler = GradScaler(
+        init_scale=2**10,        # Start with smaller scale
+        growth_factor=1.5,       # More conservative growth
+        backoff_factor=0.5,      # More aggressive backoff
+        growth_interval=100,     # Increase scale less frequently
+        enabled=True
+    )
     
     # Print training config
     print("\nTraining configuration:")
