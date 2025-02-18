@@ -260,6 +260,15 @@ def train(
                     log_file.flush()
                 
                 if global_step % config['save_steps'] == 0:
+                    # Delete previous checkpoint if it exists
+                    prev_step = global_step - config['save_steps']
+                    if prev_step > 0:
+                        prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
+                        if os.path.exists(prev_checkpoint):
+                            os.remove(prev_checkpoint)
+                            log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
+                    
+                    # Save new checkpoint
                     checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
                     torch.save({
                         'step': global_step,
