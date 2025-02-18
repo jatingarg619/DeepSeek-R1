@@ -115,7 +115,7 @@ def train(
     device: torch.device,
     config: dict,
     save_dir: str = "checkpoints",
-    resume_from: int = 0  # Add resume capability
+    resume_from: int = 0
 ):
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs("logs/training", exist_ok=True)
@@ -125,7 +125,6 @@ def train(
     
     if resume_from > 0:
         log_file.write(f"\nResuming training from step {resume_from}\n")
-        # Load checkpoint
         checkpoint_path = os.path.join(save_dir, f'model_step_{resume_from}.pt')
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path)
@@ -141,9 +140,8 @@ def train(
     gradient_accumulation_steps = config['gradient_accumulation_steps']
     total_loss = 0
     
-    # Training loop
     progress_bar = tqdm(range(resume_from, config['max_steps']))
-    max_retries = 5  # Maximum number of retries for network errors
+    max_retries = 5
     
     try:
         for step in range(resume_from, config['max_steps']):
@@ -154,13 +152,7 @@ def train(
                     break
                 except Exception as e:
                     retry_count += 1
-                    error_msg = f"\nNetwork error when fetching batch (attempt {retry_count}/{max_retries}): {str(e)}"
-                    print(error_msg)
-                    log_file.write(error_msg + "\n")
-                    log_file.flush()
-                    
                     if retry_count == max_retries:
-                        # Save checkpoint before raising error
                         checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
                         torch.save({
                             'step': global_step,
@@ -169,71 +161,40 @@ def train(
                             'scheduler_state_dict': scheduler.state_dict(),
                             'loss': total_loss / (step + 1) if step > 0 else 0,
                         }, checkpoint_path)
-                        error_msg = f"\nMaximum retries exceeded. Saved checkpoint to {checkpoint_path}"
-                        print(error_msg)
-                        log_file.write(error_msg + "\n")
+                        log_file.write(f"\nMaximum retries exceeded. Saved checkpoint to {checkpoint_path}\n")
                         log_file.flush()
                         raise Exception("Maximum retries exceeded when fetching batch")
-                    
-                    time.sleep(5)  # Wait 5 seconds before retrying
+                    time.sleep(5)
             
-            # Ensure proper tensor dimensions and types
             input_ids = batch['input_ids'].unsqueeze(0).to(device)
             labels = batch['labels'].unsqueeze(0).to(device)
             attention_mask = batch['attention_mask'].unsqueeze(0).to(device)
             
-            # Debug input tensors
-            print("\nInput tensor stats:")
-            print(f"input_ids shape: {input_ids.shape}, range: [{input_ids.min()}, {input_ids.max()}]")
-            print(f"labels shape: {labels.shape}, range: [{labels.min()}, {labels.max()}]")
-            print(f"attention_mask shape: {attention_mask.shape}, values: {attention_mask.sum()/attention_mask.numel():.2%} non-zero")
-            
-            # Forward pass with mixed precision and debugging
             with autocast(device_type=device.type):
-                # Get logits and print stats
                 logits = model(input_ids, attention_mask)
-                print(f"\nLogits stats:")
-                print(f"shape: {logits.shape}")
-                print(f"range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
-                print(f"mean: {logits.mean().item():.4f}, std: {logits.std().item():.4f}")
                 
-                # Check for inf values in logits
                 if torch.isinf(logits).any():
-                    print("Inf values detected in logits!")
                     continue
                 
-                # Compute loss with more detailed error checking
                 try:
                     loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-                    print(f"\nInitial loss value: {loss.item():.4f}")
-                except RuntimeError as e:
-                    print(f"Error in loss computation: {e}")
+                except RuntimeError:
                     continue
                 
-                # Check for NaN in main loss
                 if torch.isnan(loss).any():
-                    print("\nNaN detected in main loss!")
-                    print("Last 5 logits values:", logits.view(-1)[-5:].tolist())
-                    print("Last 5 labels values:", labels.view(-1)[-5:].tolist())
                     continue
                 
-                # Add auxiliary loss for load balancing if using MoE
                 if hasattr(model, 'layers') and hasattr(model.layers[0], 'moe'):
                     expert_counts = torch.zeros(model.config.num_experts, device=device)
                     hidden_states = model.embed_tokens(input_ids)
-                    print(f"\nHidden states stats:")
-                    print(f"shape: {hidden_states.shape}")
-                    print(f"range: [{hidden_states.min().item():.4f}, {hidden_states.max().item():.4f}]")
                     
-                    for layer_idx, layer in enumerate(model.layers):
+                    for layer in model.layers:
                         router_logits = layer.moe.gate(hidden_states)
                         if torch.isnan(router_logits).any():
-                            print(f"NaN detected in router_logits at layer {layer_idx}")
                             continue
                             
                         router_probs = torch.softmax(router_logits, dim=-1)
                         if torch.isnan(router_probs).any():
-                            print(f"NaN detected in router_probs at layer {layer_idx}")
                             continue
                             
                         expert_counts += router_probs.sum(dim=(0, 1))
@@ -244,54 +205,34 @@ def train(
                     
                     if not torch.isnan(aux_loss).any():
                         loss += aux_loss
-                        print(f"Auxiliary loss added: {aux_loss.item():.4f}")
                 
                 loss = loss / gradient_accumulation_steps
-                print(f"Final loss value: {loss.item():.4f}")
             
-            # Skip backward pass if loss is NaN
             if torch.isnan(loss).any():
-                print("\nNaN detected in final loss! Skipping backward pass...")
-                log_file.write("\nNaN detected in final loss! Skipping backward pass...\n")
                 continue
             
-            # Backward pass with gradient scaling
             scaler.scale(loss).backward()
             
-            # Check for NaN in gradients
             valid_gradients = True
             for name, param in model.named_parameters():
                 if param.grad is not None and torch.isnan(param.grad).any():
-                    print(f"\nNaN detected in gradients for {name}!")
-                    log_file.write(f"\nNaN detected in gradients for {name}!\n")
                     valid_gradients = False
                     break
             
             if not valid_gradients:
-                print("Skipping optimizer step due to NaN gradients...")
-                log_file.write("Skipping optimizer step due to NaN gradients...\n")
                 optimizer.zero_grad()
                 continue
             
             total_loss += loss.item()
             
             if (step + 1) % gradient_accumulation_steps == 0:
-                # Gradient clipping with logging
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
                 
                 if torch.isnan(grad_norm):
-                    print("\nNaN detected in gradient norm! Skipping optimizer step...")
-                    log_file.write("\nNaN detected in gradient norm! Skipping optimizer step...\n")
                     optimizer.zero_grad()
                     continue
                 
-                # Log gradient norm
-                if global_step % 100 == 0:
-                    print(f"\nGradient norm: {grad_norm:.4f}")
-                    log_file.write(f"\nGradient norm: {grad_norm:.4f}\n")
-                
-                # Optimizer step with gradient scaling
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -299,7 +240,6 @@ def train(
                 
                 global_step += 1
                 
-                # Update progress bar with average loss
                 avg_loss = total_loss * gradient_accumulation_steps / (step + 1)
                 progress_bar.set_postfix({
                     "loss": f"{avg_loss:.4f}",
@@ -308,8 +248,7 @@ def train(
                 })
                 progress_bar.update(1)
                 
-                # Print and log detailed stats every 100 steps
-                if global_step % 100 == 0:
+                if global_step % 500 == 0:
                     log_message = (
                         f"\nStep {global_step}\n"
                         f"Average Loss: {avg_loss:.4f}\n"
@@ -317,11 +256,9 @@ def train(
                         f"Gradient Norm: {grad_norm:.4f}\n"
                         + "-" * 50
                     )
-                    print(log_message)
                     log_file.write(log_message + "\n")
                     log_file.flush()
                 
-                # Save checkpoint, log, and generate test outputs
                 if global_step % config['save_steps'] == 0:
                     checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
                     torch.save({
@@ -331,20 +268,12 @@ def train(
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': avg_loss,
                     }, checkpoint_path)
-                    checkpoint_message = f"\nCheckpoint saved: {checkpoint_path}"
-                    print(checkpoint_message)
-                    log_file.write(checkpoint_message + "\n")
-                    
-                    # Generate test outputs
-                    print("\nGenerating test outputs...")
+                    log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
                     test_generation(model, tokenizer, device, log_file)
-                    print("Test outputs generated and logged")
-                    
                     log_file.flush()
 
     except Exception as e:
         error_msg = f"\nTraining interrupted at step {global_step}: {str(e)}"
-        print(error_msg)
         log_file.write(error_msg + "\n")
         log_file.flush()
         raise
