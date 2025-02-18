@@ -11,6 +11,8 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
+import time
+from huggingface_hub import login
 
 # Test prompts for generation
 TEST_PROMPTS = [
@@ -62,7 +64,7 @@ def test_generation(model, tokenizer, device, log_file):
 
 def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
     def tokenize_function(examples):
-        # Concatenate all texts and add EOS token
+        # Use the text field from Cosmopedia dataset
         text = examples['text']
         tokenized = tokenizer(
             text, 
@@ -78,7 +80,7 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
         attention_mask = tokenized['attention_mask'][:, :-1]
         
         # Ensure proper dimensions
-        input_ids = input_ids.squeeze(0)  # Remove batch dimension if present
+        input_ids = input_ids.squeeze(0)
         labels = labels.squeeze(0)
         attention_mask = attention_mask.squeeze(0)
         
@@ -109,139 +111,255 @@ def train(
     scaler: GradScaler,
     device: torch.device,
     config: dict,
-    save_dir: str = "checkpoints"
+    save_dir: str = "checkpoints",
+    resume_from: int = 0  # Add resume capability
 ):
     os.makedirs(save_dir, exist_ok=True)
-    os.makedirs("logs/training", exist_ok=True)  # Create logs directory
+    os.makedirs("logs/training", exist_ok=True)
     
-    # Open log file
     log_file = open("logs/training/training_log.txt", "a")
     log_file.write("\n" + "="*50 + "\nNew Training Run\n" + "="*50 + "\n")
+    
+    if resume_from > 0:
+        log_file.write(f"\nResuming training from step {resume_from}\n")
+        # Load checkpoint
+        checkpoint_path = os.path.join(save_dir, f'model_step_{resume_from}.pt')
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            log_file.write(f"Loaded checkpoint from {checkpoint_path}\n")
     
     model.train()
     criterion = nn.CrossEntropyLoss()
     
-    global_step = 0
+    global_step = resume_from
     gradient_accumulation_steps = config['gradient_accumulation_steps']
     total_loss = 0
     
     # Training loop
-    progress_bar = tqdm(range(config['max_steps']))
-    for step in range(config['max_steps']):
-        batch = next(iter(dataset))
-        
-        # Ensure proper tensor dimensions and types
-        input_ids = batch['input_ids'].unsqueeze(0).to(device)  # Add batch dimension
-        labels = batch['labels'].unsqueeze(0).to(device)
-        attention_mask = batch['attention_mask'].unsqueeze(0).to(device)  # Already boolean from dataloader
-        
-        # Forward pass with mixed precision
-        with autocast(device_type=device.type):
-            logits = model(input_ids, attention_mask)
-            loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+    progress_bar = tqdm(range(resume_from, config['max_steps']))
+    max_retries = 5  # Maximum number of retries for network errors
+    
+    try:
+        for step in range(resume_from, config['max_steps']):
+            retry_count = 0
+            while retry_count < max_retries:
+                try:
+                    batch = next(iter(dataset))
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    error_msg = f"\nNetwork error when fetching batch (attempt {retry_count}/{max_retries}): {str(e)}"
+                    print(error_msg)
+                    log_file.write(error_msg + "\n")
+                    log_file.flush()
+                    
+                    if retry_count == max_retries:
+                        # Save checkpoint before raising error
+                        checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
+                        torch.save({
+                            'step': global_step,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'loss': total_loss / (step + 1) if step > 0 else 0,
+                        }, checkpoint_path)
+                        error_msg = f"\nMaximum retries exceeded. Saved checkpoint to {checkpoint_path}"
+                        print(error_msg)
+                        log_file.write(error_msg + "\n")
+                        log_file.flush()
+                        raise Exception("Maximum retries exceeded when fetching batch")
+                    
+                    time.sleep(5)  # Wait 5 seconds before retrying
             
-            # Add auxiliary loss for load balancing if using MoE
-            if hasattr(model, 'layers') and hasattr(model.layers[0], 'moe'):
-                expert_counts = torch.zeros(model.config.num_experts, device=device)
-                # First get the embeddings
-                hidden_states = model.embed_tokens(input_ids)
-                for layer in model.layers:
-                    # Pass the embedded states through the gate
-                    router_logits = layer.moe.gate(hidden_states)
-                    router_probs = torch.softmax(router_logits, dim=-1)
-                    expert_counts += router_probs.sum(dim=(0, 1))
+            # Ensure proper tensor dimensions and types
+            input_ids = batch['input_ids'].unsqueeze(0).to(device)
+            labels = batch['labels'].unsqueeze(0).to(device)
+            attention_mask = batch['attention_mask'].unsqueeze(0).to(device)
+            
+            # Forward pass with mixed precision
+            with autocast(device_type=device.type):
+                logits = model(input_ids, attention_mask)
+                loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
                 
-                target_count = input_ids.size(0) * input_ids.size(1) / model.config.num_experts
-                balance_loss = torch.mean((expert_counts - target_count).pow(2))
-                aux_loss = 0.01 * balance_loss
-                loss += aux_loss
-            
-            loss = loss / gradient_accumulation_steps
-        
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
-        total_loss += loss.item()
-        
-        if (step + 1) % gradient_accumulation_steps == 0:
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # Optimizer step with gradient scaling
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            optimizer.zero_grad()
-            
-            global_step += 1
-            
-            # Update progress bar with average loss
-            avg_loss = total_loss * gradient_accumulation_steps / (step + 1)
-            progress_bar.set_postfix({
-                "loss": f"{avg_loss:.4f}",
-                "lr": f"{scheduler.get_last_lr()[0]:.6f}"
-            })
-            progress_bar.update(1)
-            
-            # Print and log detailed stats every 100 steps
-            if global_step % 100 == 0:
-                log_message = (
-                    f"\nStep {global_step}\n"
-                    f"Average Loss: {avg_loss:.4f}\n"
-                    f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
-                    + "-" * 50
-                )
-                print(log_message)
-                log_file.write(log_message + "\n")
-                log_file.flush()  # Ensure logs are written immediately
-            
-            # Save checkpoint, log, and generate test outputs
-            if global_step % config['save_steps'] == 0:
-                checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
-                torch.save({
-                    'step': global_step,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'loss': avg_loss,
-                }, checkpoint_path)
-                checkpoint_message = f"\nCheckpoint saved: {checkpoint_path}"
-                print(checkpoint_message)
-                log_file.write(checkpoint_message + "\n")
+                # Check for NaN in main loss
+                if torch.isnan(loss).any():
+                    print("\nNaN detected in main loss! Skipping batch...")
+                    log_file.write("\nNaN detected in main loss! Skipping batch...\n")
+                    continue
                 
-                # Generate test outputs
-                print("\nGenerating test outputs...")
-                test_generation(model, tokenizer, device, log_file)
-                print("Test outputs generated and logged")
+                # Add auxiliary loss for load balancing if using MoE
+                if hasattr(model, 'layers') and hasattr(model.layers[0], 'moe'):
+                    expert_counts = torch.zeros(model.config.num_experts, device=device)
+                    hidden_states = model.embed_tokens(input_ids)
+                    
+                    for layer in model.layers:
+                        router_logits = layer.moe.gate(hidden_states)
+                        router_probs = torch.softmax(router_logits, dim=-1)
+                        expert_counts += router_probs.sum(dim=(0, 1))
+                    
+                    target_count = input_ids.size(0) * input_ids.size(1) / model.config.num_experts
+                    balance_loss = torch.mean((expert_counts - target_count).pow(2))
+                    aux_loss = 0.01 * balance_loss
+                    
+                    # Check for NaN in auxiliary loss
+                    if torch.isnan(aux_loss).any():
+                        print("\nNaN detected in auxiliary loss! Skipping auxiliary loss...")
+                        log_file.write("\nNaN detected in auxiliary loss! Skipping auxiliary loss...\n")
+                    else:
+                        loss += aux_loss
                 
-                log_file.flush()
+                loss = loss / gradient_accumulation_steps
+            
+            # Skip backward pass if loss is NaN
+            if torch.isnan(loss).any():
+                print("\nNaN detected in final loss! Skipping backward pass...")
+                log_file.write("\nNaN detected in final loss! Skipping backward pass...\n")
+                continue
+            
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            
+            # Check for NaN in gradients
+            valid_gradients = True
+            for name, param in model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"\nNaN detected in gradients for {name}!")
+                    log_file.write(f"\nNaN detected in gradients for {name}!\n")
+                    valid_gradients = False
+                    break
+            
+            if not valid_gradients:
+                print("Skipping optimizer step due to NaN gradients...")
+                log_file.write("Skipping optimizer step due to NaN gradients...\n")
+                optimizer.zero_grad()
+                continue
+            
+            total_loss += loss.item()
+            
+            if (step + 1) % gradient_accumulation_steps == 0:
+                # Gradient clipping with logging
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
+                
+                if torch.isnan(grad_norm):
+                    print("\nNaN detected in gradient norm! Skipping optimizer step...")
+                    log_file.write("\nNaN detected in gradient norm! Skipping optimizer step...\n")
+                    optimizer.zero_grad()
+                    continue
+                
+                # Log gradient norm
+                if global_step % 100 == 0:
+                    print(f"\nGradient norm: {grad_norm:.4f}")
+                    log_file.write(f"\nGradient norm: {grad_norm:.4f}\n")
+                
+                # Optimizer step with gradient scaling
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+                
+                global_step += 1
+                
+                # Update progress bar with average loss
+                avg_loss = total_loss * gradient_accumulation_steps / (step + 1)
+                progress_bar.set_postfix({
+                    "loss": f"{avg_loss:.4f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.6f}",
+                    "grad_norm": f"{grad_norm:.4f}"
+                })
+                progress_bar.update(1)
+                
+                # Print and log detailed stats every 100 steps
+                if global_step % 100 == 0:
+                    log_message = (
+                        f"\nStep {global_step}\n"
+                        f"Average Loss: {avg_loss:.4f}\n"
+                        f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
+                        f"Gradient Norm: {grad_norm:.4f}\n"
+                        + "-" * 50
+                    )
+                    print(log_message)
+                    log_file.write(log_message + "\n")
+                    log_file.flush()
+                
+                # Save checkpoint, log, and generate test outputs
+                if global_step % config['save_steps'] == 0:
+                    checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
+                    torch.save({
+                        'step': global_step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': avg_loss,
+                    }, checkpoint_path)
+                    checkpoint_message = f"\nCheckpoint saved: {checkpoint_path}"
+                    print(checkpoint_message)
+                    log_file.write(checkpoint_message + "\n")
+                    
+                    # Generate test outputs
+                    print("\nGenerating test outputs...")
+                    test_generation(model, tokenizer, device, log_file)
+                    print("Test outputs generated and logged")
+                    
+                    log_file.flush()
 
-    # Close log file
-    log_file.close()
+    except Exception as e:
+        error_msg = f"\nTraining interrupted at step {global_step}: {str(e)}"
+        print(error_msg)
+        log_file.write(error_msg + "\n")
+        log_file.flush()
+        raise
+    
+    finally:
+        log_file.close()
 
 def main():
     # Training configuration
     config = {
         'batch_size': 2,
-        'gradient_accumulation_steps': 16,  # Effective batch size = 32
-        'learning_rate': 1e-4,
-        'weight_decay': 0.01,
-        'max_steps': 10000,  # Changed from 11000 to 10000
+        'gradient_accumulation_steps': 16,
+        'learning_rate': 5e-5,
+        'weight_decay': 0.1,
+        'max_steps': 10000,
         'warmup_steps': 2000,
         'save_steps': 1000,
-        'seed': 42
+        'seed': 42,
+        'max_grad_norm': 0.5,
+        'resume_from': 0
     }
+    
+    # Check for existing checkpoints
+    checkpoints = sorted([
+        int(f.split('_')[1].split('.')[0])
+        for f in os.listdir('checkpoints')
+        if f.startswith('model_step_') and f.endswith('.pt')
+    ], reverse=True)
+    
+    if checkpoints:
+        latest_step = checkpoints[0]
+        print(f"\nFound existing checkpoint at step {latest_step}")
+        user_input = input("Would you like to resume from this checkpoint? (y/n): ")
+        if user_input.lower() == 'y':
+            config['resume_from'] = latest_step
     
     # Set random seed
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     
+    # Enable deterministic behavior
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nUsing device: {device}")
     
-    # Initialize model config
+    # Initialize model config with adjusted parameters
     model_config = DeepSeekConfig()
+    model_config.initializer_range = 0.01  # Reduced from 0.02
     
     # Load tokenizer - Using SmolLM2 tokenizer
     print("\nLoading tokenizer...")
@@ -258,13 +376,28 @@ def main():
     print(f"Padding token ID: {model_config.pad_token_id}")
     
     # Load dataset with streaming
-    print("\nLoading dataset...")
-    dataset = load_dataset(
-        "HuggingFaceTB/smollm-corpus",
-        "cosmopedia-v2",
-        split="train",
-        streaming=True
-    )
+    print("\nLoading Cosmopedia dataset (web_samples_v2 split)...")
+    try:
+        dataset = load_dataset(
+            "HuggingFaceTB/cosmopedia",
+            "web_samples_v2",  # Using web_samples_v2 split for refined prompts
+            split="train",
+            streaming=True
+        )
+        print("Successfully loaded Cosmopedia dataset")
+    except Exception as e:
+        print(f"\nError loading Cosmopedia dataset: {str(e)}")
+        print("Attempting to load with authentication...")
+        # You might need to add your HuggingFace token here if the dataset requires authentication
+        login()  # This will prompt for token if needed
+        dataset = load_dataset(
+            "HuggingFaceTB/cosmopedia",
+            "web_samples_v2",
+            split="train",
+            streaming=True
+        )
+    
+    print("\nDataset features:", dataset.features)
     
     # Create training dataset
     print("\nPreparing dataset...")
@@ -304,20 +437,44 @@ def main():
         print(f"{k}: {v}")
     print("-" * 50)
     
-    # Train the model
+    # Train the model with resume capability
     print("\nStarting training...")
-    train(
-        model=model,
-        dataset=train_dataset,
-        tokenizer=tokenizer,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        device=device,
-        config=config,
-        save_dir='checkpoints'
-    )
-    print("\nTraining completed!")
+    while True:
+        try:
+            train(
+                model=model,
+                dataset=train_dataset,
+                tokenizer=tokenizer,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                device=device,
+                config=config,
+                save_dir='checkpoints',
+                resume_from=config['resume_from']
+            )
+            print("\nTraining completed successfully!")
+            break
+        except Exception as e:
+            print(f"\nTraining interrupted: {str(e)}")
+            user_input = input("Would you like to resume training? (y/n): ")
+            if user_input.lower() != 'y':
+                print("Training terminated by user.")
+                break
+            
+            # Find the latest checkpoint
+            checkpoints = sorted([
+                int(f.split('_')[1].split('.')[0])
+                for f in os.listdir('checkpoints')
+                if f.startswith('model_step_') and f.endswith('.pt')
+            ], reverse=True)
+            
+            if checkpoints:
+                config['resume_from'] = checkpoints[0]
+                print(f"Resuming from step {config['resume_from']}")
+            else:
+                print("No checkpoints found. Starting from beginning.")
+                config['resume_from'] = 0
 
 if __name__ == '__main__':
     main() 
