@@ -179,39 +179,72 @@ def train(
             labels = batch['labels'].unsqueeze(0).to(device)
             attention_mask = batch['attention_mask'].unsqueeze(0).to(device)
             
-            # Forward pass with mixed precision
+            # Debug input tensors
+            print("\nInput tensor stats:")
+            print(f"input_ids shape: {input_ids.shape}, range: [{input_ids.min()}, {input_ids.max()}]")
+            print(f"labels shape: {labels.shape}, range: [{labels.min()}, {labels.max()}]")
+            print(f"attention_mask shape: {attention_mask.shape}, values: {attention_mask.sum()/attention_mask.numel():.2%} non-zero")
+            
+            # Forward pass with mixed precision and debugging
             with autocast(device_type=device.type):
+                # Get logits and print stats
                 logits = model(input_ids, attention_mask)
-                loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                print(f"\nLogits stats:")
+                print(f"shape: {logits.shape}")
+                print(f"range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
+                print(f"mean: {logits.mean().item():.4f}, std: {logits.std().item():.4f}")
+                
+                # Check for inf values in logits
+                if torch.isinf(logits).any():
+                    print("Inf values detected in logits!")
+                    continue
+                
+                # Compute loss with more detailed error checking
+                try:
+                    loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                    print(f"\nInitial loss value: {loss.item():.4f}")
+                except RuntimeError as e:
+                    print(f"Error in loss computation: {e}")
+                    continue
                 
                 # Check for NaN in main loss
                 if torch.isnan(loss).any():
-                    print("\nNaN detected in main loss! Skipping batch...")
-                    log_file.write("\nNaN detected in main loss! Skipping batch...\n")
+                    print("\nNaN detected in main loss!")
+                    print("Last 5 logits values:", logits.view(-1)[-5:].tolist())
+                    print("Last 5 labels values:", labels.view(-1)[-5:].tolist())
                     continue
                 
                 # Add auxiliary loss for load balancing if using MoE
                 if hasattr(model, 'layers') and hasattr(model.layers[0], 'moe'):
                     expert_counts = torch.zeros(model.config.num_experts, device=device)
                     hidden_states = model.embed_tokens(input_ids)
+                    print(f"\nHidden states stats:")
+                    print(f"shape: {hidden_states.shape}")
+                    print(f"range: [{hidden_states.min().item():.4f}, {hidden_states.max().item():.4f}]")
                     
-                    for layer in model.layers:
+                    for layer_idx, layer in enumerate(model.layers):
                         router_logits = layer.moe.gate(hidden_states)
+                        if torch.isnan(router_logits).any():
+                            print(f"NaN detected in router_logits at layer {layer_idx}")
+                            continue
+                            
                         router_probs = torch.softmax(router_logits, dim=-1)
+                        if torch.isnan(router_probs).any():
+                            print(f"NaN detected in router_probs at layer {layer_idx}")
+                            continue
+                            
                         expert_counts += router_probs.sum(dim=(0, 1))
                     
                     target_count = input_ids.size(0) * input_ids.size(1) / model.config.num_experts
                     balance_loss = torch.mean((expert_counts - target_count).pow(2))
                     aux_loss = 0.01 * balance_loss
                     
-                    # Check for NaN in auxiliary loss
-                    if torch.isnan(aux_loss).any():
-                        print("\nNaN detected in auxiliary loss! Skipping auxiliary loss...")
-                        log_file.write("\nNaN detected in auxiliary loss! Skipping auxiliary loss...\n")
-                    else:
+                    if not torch.isnan(aux_loss).any():
                         loss += aux_loss
+                        print(f"Auxiliary loss added: {aux_loss.item():.4f}")
                 
                 loss = loss / gradient_accumulation_steps
+                print(f"Final loss value: {loss.item():.4f}")
             
             # Skip backward pass if loss is NaN
             if torch.isnan(loss).any():
