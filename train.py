@@ -414,13 +414,38 @@ def main():
         token = input("\nPlease enter your HuggingFace token: ")
         login(token=token, add_to_git_credential=False)
         
-        # Then load the dataset
+        # Configure dataset loading with increased timeouts
+        from datasets.config import HF_DATASETS_CACHE
+        from datasets.utils.file_utils import get_datasets_user_agent
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        # Configure session with longer timeouts
+        session = requests.Session()
+        session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+        session.headers.update({"user-agent": get_datasets_user_agent()})
+        session.request = lambda method, url, *args, **kwargs: super(requests.Session, session).request(
+            method=method,
+            url=url,
+            *args,
+            **{**kwargs, "timeout": 30}  # 30 second timeout
+        )
+        
+        # Then load the dataset with custom session
         dataset = load_dataset(
             "HuggingFaceTB/cosmopedia",
             "web_samples_v2",
             split="train",
             streaming=True,
-            token=token  # Use token parameter instead of use_auth_token
+            token=token,
+            download_config={"session": session}
         )
         print("Successfully loaded Cosmopedia dataset")
     except Exception as e:
