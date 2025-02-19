@@ -411,25 +411,20 @@ def main():
     # Load dataset with streaming and increased timeout
     print("\nLoading Cosmopedia dataset (web_samples_v2 split)...")
     try:
+        # First try to authenticate
+        login()
+        
+        # Then load the dataset
         dataset = load_dataset(
             "HuggingFaceTB/cosmopedia",
             "web_samples_v2",
             split="train",
-            streaming=True,
-            download_timeout=config['timeout']
+            streaming=True
         )
         print("Successfully loaded Cosmopedia dataset")
     except Exception as e:
         print(f"\nError loading Cosmopedia dataset: {str(e)}")
-        print("Attempting to load with authentication...")
-        login()
-        dataset = load_dataset(
-            "HuggingFaceTB/cosmopedia",
-            "web_samples_v2",
-            split="train",
-            streaming=True,
-            download_timeout=config['timeout']
-        )
+        raise  # Re-raise the exception since we can't proceed without the dataset
     
     print("\nDataset features:", dataset.features)
     
