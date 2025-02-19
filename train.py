@@ -13,6 +13,9 @@ from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 import time
 from huggingface_hub import login
+import atexit
+import signal
+import gc
 
 # Test prompts for generation
 TEST_PROMPTS = [
@@ -96,11 +99,12 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             'attention_mask': attention_mask
         }
     
-    # Tokenize the dataset
+    # Tokenize the dataset with caching
     tokenized_dataset = dataset.map(
         tokenize_function,
         remove_columns=dataset.column_names,
-        batched=True
+        batched=True,
+        cache_file_name="cached_dataset"  # Enable caching to avoid repeated downloads
     )
     
     return tokenized_dataset
@@ -141,18 +145,18 @@ def train(
     total_loss = 0
     
     progress_bar = tqdm(range(resume_from, config['max_steps']))
-    max_retries = 5
     
     try:
         for step in range(resume_from, config['max_steps']):
             retry_count = 0
-            while retry_count < max_retries:
+            while retry_count < config['max_retries']:
                 try:
                     batch = next(iter(dataset))
                     break
                 except Exception as e:
                     retry_count += 1
-                    if retry_count == max_retries:
+                    if retry_count == config['max_retries']:
+                        # Save checkpoint before giving up
                         checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
                         torch.save({
                             'step': global_step,
@@ -163,8 +167,13 @@ def train(
                         }, checkpoint_path)
                         log_file.write(f"\nMaximum retries exceeded. Saved checkpoint to {checkpoint_path}\n")
                         log_file.flush()
-                        raise Exception("Maximum retries exceeded when fetching batch")
-                    time.sleep(5)
+                        raise Exception(f"Maximum retries ({config['max_retries']}) exceeded when fetching batch")
+                    
+                    # Wait with exponential backoff
+                    wait_time = config['retry_delay'] * (2 ** (retry_count - 1))
+                    log_file.write(f"\nRetry {retry_count}/{config['max_retries']} after {wait_time}s. Error: {str(e)}\n")
+                    log_file.flush()
+                    time.sleep(wait_time)
             
             input_ids = batch['input_ids'].unsqueeze(0).to(device)
             labels = batch['labels'].unsqueeze(0).to(device)
@@ -248,7 +257,7 @@ def train(
                 })
                 progress_bar.update(1)
                 
-                if global_step % 500 == 0:
+                if global_step % 100 == 0:
                     log_message = (
                         f"\nStep {global_step}\n"
                         f"Average Loss: {avg_loss:.4f}\n"
@@ -257,6 +266,28 @@ def train(
                         + "-" * 50
                     )
                     log_file.write(log_message + "\n")
+                    log_file.flush()
+                    
+                    # Save checkpoint every 100 steps
+                    # Delete previous checkpoint if it exists
+                    prev_step = global_step - 100
+                    if prev_step > 0:
+                        prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
+                        if os.path.exists(prev_checkpoint):
+                            os.remove(prev_checkpoint)
+                            log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
+                    
+                    # Save new checkpoint
+                    checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
+                    torch.save({
+                        'step': global_step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': avg_loss,
+                    }, checkpoint_path)
+                    log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
+                    test_generation(model, tokenizer, device, log_file)
                     log_file.flush()
                 
                 if global_step % config['save_steps'] == 0:
@@ -285,12 +316,30 @@ def train(
         error_msg = f"\nTraining interrupted at step {global_step}: {str(e)}"
         log_file.write(error_msg + "\n")
         log_file.flush()
+        
+        # Ensure cleanup happens
+        torch.cuda.empty_cache()
+        gc.collect()
+        
         raise
     
     finally:
         log_file.close()
+        torch.cuda.empty_cache()
+        gc.collect()
 
 def main():
+    # Cleanup function
+    def cleanup():
+        print("\nCleaning up resources...")
+        gc.collect()
+        torch.cuda.empty_cache()
+    
+    # Register cleanup for normal exit and signals
+    atexit.register(cleanup)
+    signal.signal(signal.SIGTERM, lambda signo, frame: cleanup())
+    signal.signal(signal.SIGINT, lambda signo, frame: cleanup())
+    
     # Training configuration
     config = {
         'batch_size': 1,
@@ -303,7 +352,10 @@ def main():
         'seed': 42,
         'max_grad_norm': 0.1,
         'resume_from': 0,
-        'block_size': 512  # Reduced from 2048 for better stability
+        'block_size': 512,
+        'max_retries': 10,        # Increased from 5
+        'retry_delay': 5,         # Seconds to wait between retries
+        'timeout': 30             # Increased timeout for downloads
     }
     
     # Check for existing checkpoints
@@ -356,26 +408,27 @@ def main():
     print(f"Vocabulary size: {model_config.vocab_size}")
     print(f"Padding token ID: {model_config.pad_token_id}")
     
-    # Load dataset with streaming
+    # Load dataset with streaming and increased timeout
     print("\nLoading Cosmopedia dataset (web_samples_v2 split)...")
     try:
         dataset = load_dataset(
             "HuggingFaceTB/cosmopedia",
-            "web_samples_v2",  # Using web_samples_v2 split for refined prompts
+            "web_samples_v2",
             split="train",
-            streaming=True
+            streaming=True,
+            download_timeout=config['timeout']
         )
         print("Successfully loaded Cosmopedia dataset")
     except Exception as e:
         print(f"\nError loading Cosmopedia dataset: {str(e)}")
         print("Attempting to load with authentication...")
-        # You might need to add your HuggingFace token here if the dataset requires authentication
-        login()  # This will prompt for token if needed
+        login()
         dataset = load_dataset(
             "HuggingFaceTB/cosmopedia",
             "web_samples_v2",
             split="train",
-            streaming=True
+            streaming=True,
+            download_timeout=config['timeout']
         )
     
     print("\nDataset features:", dataset.features)
