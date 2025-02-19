@@ -99,12 +99,11 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             'attention_mask': attention_mask
         }
     
-    # Tokenize the dataset with caching
+    # Tokenize the dataset without caching for streaming dataset
     tokenized_dataset = dataset.map(
         tokenize_function,
         remove_columns=dataset.column_names,
-        batched=True,
-        cache_file_name="cached_dataset"  # Enable caching to avoid repeated downloads
+        batched=True
     )
     
     return tokenized_dataset
@@ -411,15 +410,17 @@ def main():
     # Load dataset with streaming and increased timeout
     print("\nLoading Cosmopedia dataset (web_samples_v2 split)...")
     try:
-        # First try to authenticate
-        login()
+        # First try to authenticate with HuggingFace
+        token = input("\nPlease enter your HuggingFace token: ")
+        login(token=token, add_to_git_credential=False)
         
         # Then load the dataset
         dataset = load_dataset(
             "HuggingFaceTB/cosmopedia",
             "web_samples_v2",
             split="train",
-            streaming=True
+            streaming=True,
+            use_auth_token=token  # Use the token for dataset access
         )
         print("Successfully loaded Cosmopedia dataset")
     except Exception as e:
