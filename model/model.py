@@ -300,26 +300,48 @@ class DeepSeekModel(nn.Module):
         return logits
 
     def generate(self, input_ids, max_length=100, temperature=1.0, top_k=50):
+        """Generate text tokens using the model.
+        
+        Args:
+            input_ids (torch.Tensor): Input token ids [batch_size, seq_len]
+            max_length (int): Maximum number of tokens to generate
+            temperature (float): Sampling temperature
+            top_k (int): Number of highest probability tokens to keep for sampling
+            
+        Returns:
+            torch.Tensor: Generated token ids [batch_size, seq_len + generated_len]
+        """
         self.eval()
         with torch.no_grad():
             # Ensure input_ids is 2D [batch_size, seq_len]
             if input_ids.dim() == 1:
                 input_ids = input_ids.unsqueeze(0)
+            elif input_ids.dim() == 3:
+                input_ids = input_ids.squeeze(0)
+                
+            batch_size = input_ids.size(0)
             
             for _ in range(max_length):
                 # Get logits for next token
-                outputs = self(input_ids)
-                next_token_logits = outputs[:, -1, :] / temperature
+                outputs = self(input_ids)  # [batch_size, seq_len, vocab_size]
+                next_token_logits = outputs[:, -1, :] / temperature  # [batch_size, vocab_size]
                 
                 # Top-k sampling
-                top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
-                probs = torch.softmax(top_k_logits, dim=-1)
-                next_token = top_k_indices[0][torch.multinomial(probs[0], 1)]
+                top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)  # [batch_size, top_k]
+                probs = torch.softmax(top_k_logits, dim=-1)  # [batch_size, top_k]
                 
-                # Add new token to sequence
-                input_ids = torch.cat([input_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
+                # Sample from the filtered distribution
+                next_tokens = torch.gather(
+                    top_k_indices,
+                    -1,
+                    torch.multinomial(probs, 1)
+                )  # [batch_size, 1]
                 
-                if next_token.item() == self.config.eos_token_id:
+                # Concatenate with input_ids
+                input_ids = torch.cat([input_ids, next_tokens], dim=1)  # [batch_size, seq_len + 1]
+                
+                # Stop if we generate EOS token
+                if (next_tokens == self.config.eos_token_id).any():
                     break
                     
         return input_ids 

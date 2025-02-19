@@ -363,16 +363,20 @@ def main():
         for f in os.listdir('checkpoints'):
             try:
                 if f.startswith('model_step_') and f.endswith('.pt'):
-                    step_num = int(f.split('_')[2].split('.')[0])
-                    checkpoints.append(step_num)
+                    # Extract step number, handling both normal and interrupted checkpoints
+                    step_str = f.replace('model_step_', '').replace('.pt', '')
+                    step_str = step_str.split('_')[0]  # Remove '_interrupted' if present
+                    step_num = int(step_str)
+                    checkpoints.append((step_num, f))
             except (ValueError, IndexError):
                 continue
     
-    checkpoints.sort(reverse=True)
+    # Sort by step number
+    checkpoints.sort(key=lambda x: x[0], reverse=True)
     
     if checkpoints:
-        latest_step = checkpoints[0]
-        print(f"\nFound existing checkpoint at step {latest_step}")
+        latest_step, latest_file = checkpoints[0]
+        print(f"\nFound existing checkpoint at step {latest_step} ({latest_file})")
         user_input = input("Would you like to resume from this checkpoint? (y/n): ")
         if user_input.lower() == 'y':
             config['resume_from'] = latest_step
