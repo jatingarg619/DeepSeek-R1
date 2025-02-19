@@ -358,11 +358,17 @@ def main():
     }
     
     # Check for existing checkpoints
-    checkpoints = sorted([
-        int(f.split('_')[1].split('.')[0])
-        for f in os.listdir('checkpoints')
-        if f.startswith('model_step_') and f.endswith('.pt')
-    ], reverse=True)
+    checkpoints = []
+    if os.path.exists('checkpoints'):
+        for f in os.listdir('checkpoints'):
+            try:
+                if f.startswith('model_step_') and f.endswith('.pt'):
+                    step_num = int(f.split('_')[2].split('.')[0])
+                    checkpoints.append(step_num)
+            except (ValueError, IndexError):
+                continue
+    
+    checkpoints.sort(reverse=True)
     
     if checkpoints:
         latest_step = checkpoints[0]

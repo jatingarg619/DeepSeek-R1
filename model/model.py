@@ -302,13 +302,21 @@ class DeepSeekModel(nn.Module):
     def generate(self, input_ids, max_length=100, temperature=1.0, top_k=50):
         self.eval()
         with torch.no_grad():
+            # Ensure input_ids is 2D [batch_size, seq_len]
+            if input_ids.dim() == 1:
+                input_ids = input_ids.unsqueeze(0)
+            
             for _ in range(max_length):
+                # Get logits for next token
                 outputs = self(input_ids)
                 next_token_logits = outputs[:, -1, :] / temperature
                 
+                # Top-k sampling
                 top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
-                next_token = top_k_indices[0][torch.multinomial(F.softmax(top_k_logits, dim=-1)[0], 1)]
+                probs = torch.softmax(top_k_logits, dim=-1)
+                next_token = top_k_indices[0][torch.multinomial(probs[0], 1)]
                 
+                # Add new token to sequence
                 input_ids = torch.cat([input_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
                 
                 if next_token.item() == self.config.eos_token_id:
