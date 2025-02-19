@@ -420,7 +420,7 @@ def main():
             "web_samples_v2",
             split="train",
             streaming=True,
-            use_auth_token=token  # Use the token for dataset access
+            token=token  # Use token parameter instead of use_auth_token
         )
         print("Successfully loaded Cosmopedia dataset")
     except Exception as e:
