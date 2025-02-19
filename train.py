@@ -65,53 +65,59 @@ def test_generation(model, tokenizer, device, log_file):
     log_file.write("\n" + "="*50 + "\n")
     log_file.flush()
 
-def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
-    def tokenize_function(examples):
-        text = examples['text']
-        tokenized = tokenizer(
-            text, 
-            truncation=True,
-            max_length=block_size + 1,  # Add 1 to account for the shift in labels
-            padding='max_length',
-            return_tensors='pt'
-        )
-        
-        # Get input_ids and attention_mask
-        input_ids = tokenized['input_ids']
-        attention_mask = tokenized['attention_mask']
-        
-        # Create input sequences and labels
-        input_ids = input_ids[:, :block_size]  # Truncate to block_size
-        labels = input_ids[:, 1:block_size + 1]  # Shift by 1 for next token prediction
-        attention_mask = attention_mask[:, :block_size]  # Match input sequence length
-        
-        # Ensure proper dimensions
-        input_ids = input_ids.squeeze(0)
-        labels = labels.squeeze(0)
-        attention_mask = attention_mask.squeeze(0)
-        
-        # Convert attention mask to boolean
-        attention_mask = attention_mask.to(torch.bool)
-        
-        # Replace padding token in labels with -100
-        labels = torch.where(attention_mask, labels, torch.tensor(-100))
-        
-        return {
-            'input_ids': input_ids,
-            'labels': labels,
-            'attention_mask': attention_mask
-        }
+def tokenize_function(examples, tokenizer, block_size):
+    text = examples['text']
+    tokenized = tokenizer(
+        text, 
+        truncation=True,
+        max_length=block_size + 1,
+        padding='max_length',
+        return_tensors='pt'
+    )
     
-    tokenized_dataset = dataset.map(
-        tokenize_function,
+    # Get input_ids and attention_mask
+    input_ids = tokenized['input_ids']
+    attention_mask = tokenized['attention_mask']
+    
+    # Create input sequences and labels
+    input_ids = input_ids[:, :block_size]
+    labels = input_ids[:, 1:block_size + 1]
+    attention_mask = attention_mask[:, :block_size]
+    
+    # Ensure proper dimensions
+    input_ids = input_ids.squeeze(0)
+    labels = labels.squeeze(0)
+    attention_mask = attention_mask.squeeze(0)
+    
+    # Convert attention mask to boolean
+    attention_mask = attention_mask.to(torch.bool)
+    
+    # Replace padding token in labels with -100
+    labels = torch.where(attention_mask, labels, torch.tensor(-100))
+    
+    return {
+        'input_ids': input_ids,
+        'labels': labels,
+        'attention_mask': attention_mask
+    }
+
+def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
+    # Create an iterator for the streaming dataset
+    dataset = dataset.map(
+        lambda examples: tokenize_function(examples, tokenizer, block_size),
         remove_columns=dataset.column_names,
         batched=True
     )
     
-    return tokenized_dataset
+    # Convert to iterator
+    dataset = dataset.shuffle(seed=42, buffer_size=10000)
+    dataset_iter = iter(dataset)
+    
+    return dataset_iter, dataset
 
 def train(
     model: nn.Module,
+    dataset_iter,
     dataset,
     tokenizer,
     optimizer: torch.optim.Optimizer,
@@ -145,19 +151,28 @@ def train(
     gradient_accumulation_steps = config['gradient_accumulation_steps']
     total_loss = 0
     
-    progress_bar = tqdm(range(resume_from, config['max_steps']))
+    progress_bar = tqdm(range(resume_from, config['max_steps']), desc="Training")
     
     try:
         for step in range(resume_from, config['max_steps']):
             retry_count = 0
+            batch = None
+            
             while retry_count < config['max_retries']:
                 try:
-                    batch = next(iter(dataset))
+                    batch = next(dataset_iter)
                     break
+                except StopIteration:
+                    # Reset iterator when we reach the end
+                    dataset_iter = iter(dataset.shuffle(seed=step).map(
+                        lambda examples: tokenize_function(examples, tokenizer, config['block_size']),
+                        remove_columns=dataset.column_names,
+                        batched=True
+                    ))
+                    continue
                 except Exception as e:
                     retry_count += 1
                     if retry_count == config['max_retries']:
-                        # Save checkpoint before giving up
                         checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
                         torch.save({
                             'step': global_step,
@@ -170,11 +185,13 @@ def train(
                         log_file.flush()
                         raise Exception(f"Maximum retries ({config['max_retries']}) exceeded when fetching batch")
                     
-                    # Wait with exponential backoff
                     wait_time = config['retry_delay'] * (2 ** (retry_count - 1))
                     log_file.write(f"\nRetry {retry_count}/{config['max_retries']} after {wait_time}s. Error: {str(e)}\n")
                     log_file.flush()
                     time.sleep(wait_time)
+            
+            if batch is None:
+                continue
             
             input_ids = batch['input_ids'].unsqueeze(0).to(device)
             labels = batch['labels'].unsqueeze(0).to(device)
@@ -465,7 +482,7 @@ def main():
     
     # Create training dataset with reduced block size
     print("\nPreparing dataset...")
-    train_dataset = create_dataloader(
+    train_dataset, dataset = create_dataloader(
         dataset,
         tokenizer,
         batch_size=config['batch_size'],
@@ -524,7 +541,8 @@ def main():
         try:
             train(
                 model=model,
-                dataset=train_dataset,
+                dataset_iter=train_dataset,
+                dataset=dataset,
                 tokenizer=tokenizer,
                 optimizer=optimizer,
                 scheduler=scheduler,
