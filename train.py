@@ -8,7 +8,7 @@ from typing import Optional, List
 import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 import time
@@ -343,13 +343,13 @@ def main():
     config = {
         'batch_size': 4,              # Increased from 1
         'gradient_accumulation_steps': 8,  # Reduced from 32
-        'learning_rate': 3e-4,        # Increased from 1e-5
-        'weight_decay': 0.1,          # Increased from 0.01
+        'learning_rate': 1e-4,        # Adjusted learning rate
+        'weight_decay': 0.01,         # Reduced weight decay
         'max_steps': 10000,
-        'warmup_steps': 1000,         # Reduced from 2000
+        'warmup_steps': 500,          # Shorter warmup
         'save_steps': 1000,
         'seed': 42,
-        'max_grad_norm': 1.0,         # Increased from 0.1
+        'max_grad_norm': 0.5,         # Reduced for stability
         'resume_from': 0,
         'block_size': 512,
         'max_retries': 10,
@@ -385,88 +385,52 @@ def main():
     
     # Initialize model config with adjusted parameters
     model_config = DeepSeekConfig()
-    model_config.initializer_range = 0.02    # Back to default
+    model_config.initializer_range = 0.01    # Reduced for better initialization
     model_config.hidden_size = 384
     model_config.intermediate_size = 1024
     model_config.num_attention_heads = 6
     model_config.num_key_value_heads = 2
-    model_config.num_hidden_layers = 12      # Reduced from 20
+    model_config.num_hidden_layers = 12
     model_config.max_position_embeddings = config['block_size']
     
-    # Load tokenizer - Using SmolLM2 tokenizer
+    # Load tokenizer and set special tokens
     print("\nLoading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
     
-    # Set padding token
+    # Ensure proper special token handling
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        print("Set padding token to EOS token")
+    model_config.pad_token_id = tokenizer.pad_token_id
+    model_config.bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.cls_token_id
+    model_config.eos_token_id = tokenizer.eos_token_id
+    
+    print(f"Vocabulary size: {tokenizer.vocab_size}")
+    print(f"Padding token ID: {model_config.pad_token_id}")
+    print(f"BOS token ID: {model_config.bos_token_id}")
+    print(f"EOS token ID: {model_config.eos_token_id}")
     
     model_config.vocab_size = tokenizer.vocab_size
-    model_config.pad_token_id = tokenizer.pad_token_id
-    print(f"Vocabulary size: {model_config.vocab_size}")
-    print(f"Padding token ID: {model_config.pad_token_id}")
-    
-    # Load dataset with streaming and increased timeout
-    print("\nLoading Cosmopedia dataset (web_samples_v2 split)...")
-    try:
-        # First try to authenticate with HuggingFace
-        token = input("\nPlease enter your HuggingFace token: ")
-        login(token=token, add_to_git_credential=False)
-        
-        # Configure dataset loading with increased timeouts
-        from datasets.config import HF_DATASETS_CACHE
-        from datasets.utils.file_utils import get_datasets_user_agent
-        from datasets.download.download_config import DownloadConfig
-        import requests
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        
-        # Create download config
-        download_config = DownloadConfig(
-            token=token,
-            max_retries=5,
-            force_download=False,
-            cache_dir=None
-        )
-        
-        # Then load the dataset
-        dataset = load_dataset(
-            "HuggingFaceTB/cosmopedia",
-            "web_samples_v2",
-            split="train",
-            streaming=True,
-            download_config=download_config
-        )
-        print("Successfully loaded Cosmopedia dataset")
-    except Exception as e:
-        print(f"\nError loading Cosmopedia dataset: {str(e)}")
-        raise  # Re-raise the exception since we can't proceed without the dataset
-    
-    print("\nDataset features:", dataset.features)
-    
-    # Create training dataset with reduced block size
-    print("\nPreparing dataset...")
-    train_dataset = create_dataloader(
-        dataset,
-        tokenizer,
-        batch_size=config['batch_size'],
-        block_size=config['block_size']  # Use smaller block size
-    )
     
     # Initialize model
     print("\nInitializing model...")
     model = DeepSeekModel(model_config).to(device)
     
-    # Initialize model weights with smaller range
+    # Better weight initialization
     def init_weights(module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=model_config.initializer_range)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
+        if isinstance(module, nn.Linear):
+            # Use Kaiming initialization for linear layers
+            torch.nn.init.kaiming_normal_(module.weight, a=0, mode='fan_in', nonlinearity='linear')
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            # Use smaller range for embeddings
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
+        elif isinstance(module, nn.LayerNorm):
+            # Initialize LayerNorm
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
     
     model.apply(init_weights)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Initialize optimizer with better settings
     optimizer = optim.AdamW(
@@ -475,20 +439,20 @@ def main():
         weight_decay=config['weight_decay'],
         betas=(0.9, 0.95),
         eps=1e-8,
-        fused=True  # Use fused implementation for faster training
+        fused=True
     )
     
-    # Initialize learning rate scheduler with cosine schedule
-    scheduler = get_linear_schedule_with_warmup(
+    # Use cosine schedule with warmup
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config['warmup_steps'],
         num_training_steps=config['max_steps']
     )
     
-    # Initialize gradient scaler with better defaults
+    # Initialize gradient scaler with more conservative settings
     scaler = GradScaler(
-        init_scale=2**16,
-        growth_factor=2.0,
+        init_scale=2**10,            # Start with smaller scale
+        growth_factor=1.5,           # More conservative growth
         backoff_factor=0.5,
         growth_interval=100
     )
