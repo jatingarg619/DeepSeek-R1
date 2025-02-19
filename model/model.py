@@ -67,7 +67,7 @@ class MultiheadLinearAttention(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         
         # Ensure latent_dim is consistent
-        self.latent_dim = (self.head_dim + config.compression_ratio - 1) // config.compression_ratio
+        self.latent_dim = self.head_dim // config.compression_ratio
         
         # Query, Key, Value projections
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
@@ -104,7 +104,7 @@ class MultiheadLinearAttention(nn.Module):
         k = self.k_proj(hidden_states)  # [batch, seq, num_kv_heads * head_dim]
         v = self.v_proj(hidden_states)  # [batch, seq, num_kv_heads * head_dim]
         
-        # Reshape and handle grouped query attention
+        # Reshape to [batch, seq, heads, head_dim]
         q = q.view(batch_size, seq_length, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
@@ -118,18 +118,18 @@ class MultiheadLinearAttention(nn.Module):
             # Compute repeat factor
             repeat_factor = self.num_heads // self.num_kv_heads
             # Repeat k and v for each query head
-            k = k.unsqueeze(2).expand(-1, -1, repeat_factor, -1, -1).reshape(batch_size, seq_length, self.num_heads, self.head_dim)
-            v = v.unsqueeze(2).expand(-1, -1, repeat_factor, -1, -1).reshape(batch_size, seq_length, self.num_heads, self.head_dim)
+            k = k.repeat_interleave(repeat_factor, dim=2)  # [batch, seq, num_heads, head_dim]
+            v = v.repeat_interleave(repeat_factor, dim=2)  # [batch, seq, num_heads, head_dim]
         
-        # Project to latent space - ensure consistent dimensions
-        q = q.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
-        k = k.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
-        v = v.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
+        # Project to latent space
+        q = q.view(-1, self.head_dim)  # [(batch * seq * num_heads), head_dim]
+        k = k.view(-1, self.head_dim)  # [(batch * seq * num_heads), head_dim]
+        v = v.view(-1, self.head_dim)  # [(batch * seq * num_heads), head_dim]
         
         # Apply latent projections
-        q_latent = self.q_latent(q)  # [(batch * seq * heads), latent_dim]
-        k_latent = self.k_latent(k)  # [(batch * seq * heads), latent_dim]
-        v_latent = self.v_latent(v)  # [(batch * seq * heads), latent_dim]
+        q_latent = self.q_latent(q)  # [(batch * seq * num_heads), latent_dim]
+        k_latent = self.k_latent(k)  # [(batch * seq * num_heads), latent_dim]
+        v_latent = self.v_latent(v)  # [(batch * seq * num_heads), latent_dim]
         
         # Reshape back to [batch, seq, heads, latent_dim]
         q_latent = q_latent.view(batch_size, seq_length, self.num_heads, self.latent_dim)
@@ -142,17 +142,17 @@ class MultiheadLinearAttention(nn.Module):
         v_latent = self.latent_norm(v_latent)
         
         # Rearrange for attention computation
-        q_latent = q_latent.transpose(1, 2)  # [batch, heads, seq, latent_dim]
-        k_latent = k_latent.transpose(1, 2)  # [batch, heads, seq, latent_dim]
-        v_latent = v_latent.transpose(1, 2)  # [batch, heads, seq, latent_dim]
+        q_latent = q_latent.transpose(1, 2)  # [batch, num_heads, seq, latent_dim]
+        k_latent = k_latent.transpose(1, 2)  # [batch, num_heads, seq, latent_dim]
+        v_latent = v_latent.transpose(1, 2)  # [batch, num_heads, seq, latent_dim]
         
         # Linear attention in latent space
         q_latent = F.elu(q_latent) + 1
         k_latent = F.elu(k_latent) + 1
         
         # Compute attention in linear space
-        kv = torch.matmul(k_latent.transpose(-2, -1), v_latent)  # [batch, heads, latent_dim, latent_dim]
-        qkv = torch.matmul(q_latent, kv)  # [batch, heads, seq, latent_dim]
+        kv = torch.matmul(k_latent.transpose(-2, -1), v_latent)  # [batch, num_heads, latent_dim, latent_dim]
+        qkv = torch.matmul(q_latent, kv)  # [batch, num_heads, seq, latent_dim]
         
         # Scale by sequence length for stability
         qkv = qkv / seq_length
@@ -164,9 +164,9 @@ class MultiheadLinearAttention(nn.Module):
             qkv = qkv.masked_fill(~attention_mask, 0.0)
         
         # Project back to head_dim
-        qkv = qkv.transpose(1, 2).contiguous()  # [batch, seq, heads, latent_dim]
-        qkv = qkv.view(-1, self.latent_dim)  # [(batch * seq * heads), latent_dim]
-        qkv = self.lat_out_proj(qkv)  # [(batch * seq * heads), head_dim]
+        qkv = qkv.transpose(1, 2).contiguous()  # [batch, seq, num_heads, latent_dim]
+        qkv = qkv.view(-1, self.latent_dim)  # [(batch * seq * num_heads), latent_dim]
+        qkv = self.lat_out_proj(qkv)  # [(batch * seq * num_heads), head_dim]
         qkv = qkv.view(batch_size, seq_length, self.num_heads, self.head_dim)
         
         # Final output projection
