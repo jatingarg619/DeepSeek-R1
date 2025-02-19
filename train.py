@@ -417,6 +417,7 @@ def main():
         # Configure dataset loading with increased timeouts
         from datasets.config import HF_DATASETS_CACHE
         from datasets.utils.file_utils import get_datasets_user_agent
+        from datasets.download.download_config import DownloadConfig
         import requests
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
@@ -438,14 +439,20 @@ def main():
             **{**kwargs, "timeout": 30}  # 30 second timeout
         )
         
+        # Create download config
+        download_config = DownloadConfig(
+            token=token,
+            session=session,
+            timeout=30
+        )
+        
         # Then load the dataset with custom session
         dataset = load_dataset(
             "HuggingFaceTB/cosmopedia",
             "web_samples_v2",
             split="train",
             streaming=True,
-            token=token,
-            download_config={"session": session}
+            download_config=download_config
         )
         print("Successfully loaded Cosmopedia dataset")
     except Exception as e:
