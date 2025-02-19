@@ -431,6 +431,48 @@ def main():
             torch.nn.init.zeros_(module.bias)
     
     model.apply(init_weights)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Load dataset with streaming and improved configuration
+    print("\nLoading Cosmopedia dataset...")
+    try:
+        # First try to authenticate with HuggingFace
+        token = input("\nPlease enter your HuggingFace token: ")
+        login(token=token, add_to_git_credential=False)
+        
+        # Configure dataset loading
+        from datasets.download.download_config import DownloadConfig
+        
+        # Create download config with retries
+        download_config = DownloadConfig(
+            token=token,
+            max_retries=config['max_retries'],
+            force_download=False
+        )
+        
+        # Load dataset with streaming
+        dataset = load_dataset(
+            "HuggingFaceTB/cosmopedia",
+            "web_samples_v2",
+            split="train",
+            streaming=True,
+            download_config=download_config
+        )
+        print("Successfully loaded Cosmopedia dataset")
+        
+        # Create training dataset
+        print("\nPreparing dataset...")
+        train_dataset = create_dataloader(
+            dataset,
+            tokenizer,
+            batch_size=config['batch_size'],
+            block_size=config['block_size']
+        )
+        print("Dataset preparation completed")
+        
+    except Exception as e:
+        print(f"\nError loading dataset: {str(e)}")
+        raise  # Re-raise the exception since we can't proceed without the dataset
     
     # Initialize optimizer with better settings
     optimizer = optim.AdamW(
