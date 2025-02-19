@@ -49,19 +49,47 @@ def generate_text(
     return generated_text
 
 def test_generation(model, tokenizer, device, log_file):
+    """Test text generation with error handling and detailed logging."""
     log_file.write("\n" + "="*50 + "\nTest Generations\n" + "="*50 + "\n")
+    
+    # Save model state and set to eval
+    model_state = model.training
+    model.eval()
     
     for i, prompt in enumerate(TEST_PROMPTS, 1):
         log_file.write(f"\nPrompt {i}: {prompt}\n")
-        generated_text = generate_text(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            device=device
-        )
-        log_file.write(f"Generated text:\n{generated_text}\n")
+        try:
+            # Tokenize with shape logging
+            input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+            log_file.write(f"Debug: Input shape: {input_ids.shape}\n")
+            
+            # Generate with error catching
+            with torch.no_grad():
+                try:
+                    outputs = model.generate(
+                        input_ids,
+                        max_length=100,
+                        temperature=0.8,
+                        top_k=50
+                    )
+                    log_file.write(f"Debug: Output shape: {outputs.shape}\n")
+                    
+                    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    log_file.write(f"Generated text:\n{generated_text}\n")
+                    
+                except RuntimeError as e:
+                    log_file.write(f"Generation error: {str(e)}\n")
+                    log_file.write(f"Input tensor shape: {input_ids.shape}\n")
+                    continue
+                    
+        except Exception as e:
+            log_file.write(f"Error in prompt {i}: {str(e)}\n")
+            continue
+            
         log_file.write("-"*50 + "\n")
     
+    # Restore model state
+    model.train(model_state)
     log_file.write("\n" + "="*50 + "\n")
     log_file.flush()
 
