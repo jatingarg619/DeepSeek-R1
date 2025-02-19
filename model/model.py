@@ -102,7 +102,7 @@ class MultiheadLinearAttention(nn.Module):
         k = self.k_proj(hidden_states)  # [batch, seq, num_kv_heads * head_dim]
         v = self.v_proj(hidden_states)  # [batch, seq, num_kv_heads * head_dim]
         
-        # Reshape to [batch, seq, heads, head_dim]
+        # Reshape and handle grouped query attention
         q = q.view(batch_size, seq_length, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
@@ -120,19 +120,9 @@ class MultiheadLinearAttention(nn.Module):
             v = v.unsqueeze(2).expand(-1, -1, repeat_factor, -1, -1).reshape(batch_size, seq_length, self.num_heads, self.head_dim)
         
         # Project to latent space
-        q = q.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
-        k = k.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
-        v = v.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
-        
-        # Apply latent projections
-        q_latent = self.q_latent(q)  # [(batch * seq * heads), latent_dim]
-        k_latent = self.k_latent(k)  # [(batch * seq * heads), latent_dim]
-        v_latent = self.v_latent(v)  # [(batch * seq * heads), latent_dim]
-        
-        # Reshape back to [batch, seq, heads, latent_dim]
-        q_latent = q_latent.view(batch_size, seq_length, self.num_heads, self.latent_dim)
-        k_latent = k_latent.view(batch_size, seq_length, self.num_heads, self.latent_dim)
-        v_latent = v_latent.view(batch_size, seq_length, self.num_heads, self.latent_dim)
+        q_latent = self.q_latent(q.view(-1, self.head_dim)).view(batch_size, seq_length, self.num_heads, self.latent_dim)
+        k_latent = self.k_latent(k.view(-1, self.head_dim)).view(batch_size, seq_length, self.num_heads, self.latent_dim)
+        v_latent = self.v_latent(v.view(-1, self.head_dim)).view(batch_size, seq_length, self.num_heads, self.latent_dim)
         
         # Apply layer norm in latent space
         q_latent = self.latent_norm(q_latent)
