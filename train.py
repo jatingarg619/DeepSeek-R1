@@ -475,11 +475,10 @@ def main():
         weight_decay=config['weight_decay'],
         betas=(0.9, 0.95),
         eps=1e-8,
-        foreach=True,
-        fused=True  # Enable fused optimizer for faster training
+        fused=True  # Use fused implementation for faster training
     )
     
-    # Initialize learning rate scheduler with longer warmup
+    # Initialize learning rate scheduler with cosine schedule
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config['warmup_steps'],
@@ -488,20 +487,30 @@ def main():
     
     # Initialize gradient scaler with better defaults
     scaler = GradScaler(
-        enabled=True,
         init_scale=2**16,
         growth_factor=2.0,
         backoff_factor=0.5,
-        growth_interval=100,
-        device='cuda'
+        growth_interval=100
     )
     
+    # Enable memory efficient attention if available
+    if hasattr(model, 'enable_mem_efficient_attention'):
+        model.enable_mem_efficient_attention()
+    
     # Add gradient checkpointing for memory efficiency
-    model.gradient_checkpointing_enable()  # Add this line after model initialization
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
     
     # Enable flash attention if available
     if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
         torch.backends.cuda.enable_flash_sdp(True)
+    
+    # Enable tensor cores for faster training
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Set higher precision for gradients
+    torch.set_float32_matmul_precision('high')
     
     # Print training config
     print("\nTraining configuration:")
