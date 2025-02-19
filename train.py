@@ -473,8 +473,8 @@ def main():
     # Initialize model config with adjusted parameters
     model_config = DeepSeekConfig()
     model_config.initializer_range = 0.01
-    model_config.hidden_size = 768
-    model_config.intermediate_size = 1536
+    model_config.hidden_size = 765  # Changed from 768 to be divisible by num_heads
+    model_config.intermediate_size = 1530  # 2x hidden_size
     model_config.num_attention_heads = 9
     model_config.num_key_value_heads = 3
     model_config.num_hidden_layers = 30
@@ -482,7 +482,7 @@ def main():
     model_config.num_experts = 8
     model_config.num_shared_experts = 1
     model_config.num_experts_per_token = 2
-    model_config.compression_ratio = 8
+    model_config.compression_ratio = 2  # Changed to ensure consistent latent dimensions
     
     # Load tokenizer - Using SmolLM2 tokenizer
     print("\nLoading tokenizer...")

@@ -61,13 +61,17 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs: torch.Tensor):
 class MultiheadLinearAttention(nn.Module):
     def __init__(self, config: DeepSeekConfig):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.hidden_size = config.hidden_size  # 765
+        self.num_heads = config.num_attention_heads  # 9
+        self.num_kv_heads = config.num_key_value_heads  # 3
+        self.head_dim = config.hidden_size // config.num_attention_heads  # 765 // 9 = 85
         
         # Ensure latent_dim is consistent
-        self.latent_dim = self.head_dim // config.compression_ratio
+        self.latent_dim = self.head_dim // config.compression_ratio  # 85 // 2 = 42
+        
+        print(f"Attention dimensions: hidden_size={self.hidden_size}, "
+              f"num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, "
+              f"head_dim={self.head_dim}, latent_dim={self.latent_dim}")
         
         # Query, Key, Value projections
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
@@ -116,7 +120,7 @@ class MultiheadLinearAttention(nn.Module):
         # Handle grouped query attention - repeat KV heads
         if self.num_kv_heads < self.num_heads:
             # Compute repeat factor
-            repeat_factor = self.num_heads // self.num_kv_heads
+            repeat_factor = self.num_heads // self.num_kv_heads  # 9 // 3 = 3
             # Repeat k and v for each query head
             k = k.repeat_interleave(repeat_factor, dim=2)  # [batch, seq, num_heads, head_dim]
             v = v.repeat_interleave(repeat_factor, dim=2)  # [batch, seq, num_heads, head_dim]
