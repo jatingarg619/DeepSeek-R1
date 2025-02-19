@@ -8,7 +8,7 @@ import torch.nn.functional as F
 @dataclass
 class DeepSeekConfig:
     vocab_size: int = 49152
-    hidden_size: int = 576
+    hidden_size: int = 768
     intermediate_size: int = 1536
     num_hidden_layers: int = 30
     num_attention_heads: int = 9
@@ -24,8 +24,10 @@ class DeepSeekConfig:
     tie_word_embeddings: bool = True
     rope_theta: float = 10000.0
     num_experts: int = 8
+    num_shared_experts: int = 1
     num_experts_per_token: int = 2
     expert_capacity_factor: float = 1.25
+    compression_ratio: int = 8  # For MLHA
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-5):
@@ -63,7 +65,7 @@ class MultiheadLinearAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.latent_dim = self.head_dim // 4  # Reduced dimension for latent space
+        self.latent_dim = self.head_dim // config.compression_ratio  # Use compression ratio
         
         # Query, Key, Value projections
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)

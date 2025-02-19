@@ -342,19 +342,19 @@ def main():
     # Training configuration
     config = {
         'batch_size': 1,
-        'gradient_accumulation_steps': 32,
-        'learning_rate': 1e-5,
-        'weight_decay': 0.01,
+        'gradient_accumulation_steps': 16,  # Reduced from 32 for faster updates
+        'learning_rate': 5e-5,  # Increased from 1e-5
+        'weight_decay': 0.1,  # Increased for better regularization
         'max_steps': 10000,
-        'warmup_steps': 2000,
+        'warmup_steps': 1000,  # Reduced warmup
         'save_steps': 1000,
         'seed': 42,
-        'max_grad_norm': 0.1,
+        'max_grad_norm': 1.0,  # Increased from 0.1 for less aggressive clipping
         'resume_from': 0,
-        'block_size': 512,
-        'max_retries': 10,        # Increased from 5
-        'retry_delay': 5,         # Seconds to wait between retries
-        'timeout': 30             # Increased timeout for downloads
+        'block_size': 2048,  # Increased from 512
+        'max_retries': 10,
+        'retry_delay': 5,
+        'timeout': 30
     }
     
     # Check for existing checkpoints
@@ -385,13 +385,17 @@ def main():
     
     # Initialize model config with adjusted parameters
     model_config = DeepSeekConfig()
-    model_config.initializer_range = 0.005
-    model_config.hidden_size = 384
-    model_config.intermediate_size = 1024
-    model_config.num_attention_heads = 6
-    model_config.num_key_value_heads = 2
-    model_config.num_hidden_layers = 20
-    model_config.max_position_embeddings = config['block_size']  # Match block size
+    model_config.initializer_range = 0.01  # More stable initialization
+    model_config.hidden_size = 768
+    model_config.intermediate_size = 1536
+    model_config.num_attention_heads = 9
+    model_config.num_key_value_heads = 3
+    model_config.num_hidden_layers = 30
+    model_config.max_position_embeddings = config['block_size']
+    model_config.num_experts = 8
+    model_config.num_shared_experts = 1
+    model_config.num_experts_per_token = 2
+    model_config.compression_ratio = 8
     
     # Load tokenizer - Using SmolLM2 tokenizer
     print("\nLoading tokenizer...")
@@ -485,12 +489,12 @@ def main():
         num_training_steps=config['max_steps']
     )
     
-    # Initialize gradient scaler with more conservative settings
+    # Initialize gradient scaler with more aggressive settings
     scaler = GradScaler(
-        init_scale=2**8,        # Even smaller initial scale
-        growth_factor=1.2,      # More conservative growth
+        init_scale=2**10,        # Increased initial scale
+        growth_factor=1.5,       # More aggressive growth
         backoff_factor=0.5,
-        growth_interval=200,    # Less frequent scale increases
+        growth_interval=100,     # More frequent scale increases
         enabled=True
     )
     
