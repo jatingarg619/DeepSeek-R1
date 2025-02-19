@@ -67,20 +67,23 @@ def test_generation(model, tokenizer, device, log_file):
 
 def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
     def tokenize_function(examples):
-        # Use the text field from Cosmopedia dataset
         text = examples['text']
         tokenized = tokenizer(
             text, 
             truncation=True,
-            max_length=block_size,
+            max_length=block_size + 1,  # Add 1 to account for the shift in labels
             padding='max_length',
             return_tensors='pt'
         )
         
-        # Create input and target sequences
-        input_ids = tokenized['input_ids'][:, :-1]
-        labels = tokenized['input_ids'][:, 1:]
-        attention_mask = tokenized['attention_mask'][:, :-1]
+        # Get input_ids and attention_mask
+        input_ids = tokenized['input_ids']
+        attention_mask = tokenized['attention_mask']
+        
+        # Create input sequences and labels
+        input_ids = input_ids[:, :block_size]  # Truncate to block_size
+        labels = input_ids[:, 1:block_size + 1]  # Shift by 1 for next token prediction
+        attention_mask = attention_mask[:, :block_size]  # Match input sequence length
         
         # Ensure proper dimensions
         input_ids = input_ids.squeeze(0)
@@ -90,7 +93,7 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
         # Convert attention mask to boolean
         attention_mask = attention_mask.to(torch.bool)
         
-        # Replace padding token in labels with -100 to ignore in loss computation
+        # Replace padding token in labels with -100
         labels = torch.where(attention_mask, labels, torch.tensor(-100))
         
         return {
@@ -99,7 +102,6 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             'attention_mask': attention_mask
         }
     
-    # Tokenize the dataset without caching for streaming dataset
     tokenized_dataset = dataset.map(
         tokenize_function,
         remove_columns=dataset.column_names,
@@ -342,16 +344,16 @@ def main():
     # Training configuration
     config = {
         'batch_size': 1,
-        'gradient_accumulation_steps': 16,  # Reduced from 32 for faster updates
-        'learning_rate': 5e-5,  # Increased from 1e-5
-        'weight_decay': 0.1,  # Increased for better regularization
+        'gradient_accumulation_steps': 16,
+        'learning_rate': 5e-5,
+        'weight_decay': 0.1,
         'max_steps': 10000,
-        'warmup_steps': 1000,  # Reduced warmup
+        'warmup_steps': 1000,
         'save_steps': 1000,
         'seed': 42,
-        'max_grad_norm': 1.0,  # Increased from 0.1 for less aggressive clipping
+        'max_grad_norm': 1.0,
         'resume_from': 0,
-        'block_size': 2048,  # Increased from 512
+        'block_size': 2048,  # Match with model's max_position_embeddings
         'max_retries': 10,
         'retry_delay': 5,
         'timeout': 30
@@ -397,7 +399,7 @@ def main():
     
     # Initialize model config with adjusted parameters
     model_config = DeepSeekConfig()
-    model_config.initializer_range = 0.01  # More stable initialization
+    model_config.initializer_range = 0.01
     model_config.hidden_size = 768
     model_config.intermediate_size = 1536
     model_config.num_attention_heads = 9

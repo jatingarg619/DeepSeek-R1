@@ -72,7 +72,7 @@ class MultiheadLinearAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         
-        # Latent projections with adjusted dimensions
+        # Latent projections
         self.q_latent = nn.Linear(self.head_dim, self.latent_dim, bias=False)
         self.k_latent = nn.Linear(self.head_dim, self.latent_dim, bias=False)
         self.v_latent = nn.Linear(self.head_dim, self.latent_dim, bias=False)
@@ -113,14 +113,18 @@ class MultiheadLinearAttention(nn.Module):
         
         # Handle grouped query attention - repeat KV heads
         if self.num_kv_heads < self.num_heads:
-            k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2)
-            v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2)
+            # Compute repeat factor
+            repeat_factor = self.num_heads // self.num_kv_heads
+            # Repeat k and v for each query head
+            k = k.unsqueeze(2).expand(-1, -1, repeat_factor, -1, -1).reshape(batch_size, seq_length, self.num_heads, self.head_dim)
+            v = v.unsqueeze(2).expand(-1, -1, repeat_factor, -1, -1).reshape(batch_size, seq_length, self.num_heads, self.head_dim)
         
         # Project to latent space
         q = q.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
         k = k.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
         v = v.view(-1, self.head_dim)  # [(batch * seq * heads), head_dim]
         
+        # Apply latent projections
         q_latent = self.q_latent(q)  # [(batch * seq * heads), latent_dim]
         k_latent = self.k_latent(k)  # [(batch * seq * heads), latent_dim]
         v_latent = self.v_latent(v)  # [(batch * seq * heads), latent_dim]
@@ -153,7 +157,10 @@ class MultiheadLinearAttention(nn.Module):
         
         # Handle attention mask
         if attention_mask is not None:
+            # Ensure mask has correct shape [batch, 1, seq, 1]
             attention_mask = attention_mask.view(batch_size, 1, seq_length, 1)
+            # Expand mask to match qkv dimensions
+            attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
             qkv = qkv.masked_fill(~attention_mask, 0.0)
         
         # Project back to head_dim
