@@ -88,12 +88,6 @@ def tokenize_function(examples, tokenizer, block_size):
     # Create labels attention mask (shifted by 1 to match labels)
     labels_attention_mask = attention_mask[:, 1:].clone()  # Shift attention mask to match labels
     
-    # Ensure proper dimensions
-    input_ids = input_ids.squeeze(0)
-    labels = labels.squeeze(0)
-    attention_mask = attention_mask.squeeze(0)
-    labels_attention_mask = labels_attention_mask.squeeze(0)
-    
     # Convert attention masks to boolean
     attention_mask = attention_mask.to(torch.bool)
     labels_attention_mask = labels_attention_mask.to(torch.bool)
@@ -102,9 +96,9 @@ def tokenize_function(examples, tokenizer, block_size):
     labels = torch.where(labels_attention_mask, labels, torch.tensor(-100))
     
     return {
-        'input_ids': input_ids,
-        'labels': labels,
-        'attention_mask': attention_mask
+        'input_ids': input_ids[0],  # Return first (and only) sequence
+        'labels': labels[0],
+        'attention_mask': attention_mask[0]
     }
 
 def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
@@ -115,22 +109,34 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
         def batch_iterator():
             buffer = []
             for example in dataset:
+                if not example["text"]:  # Skip empty texts
+                    continue
+                    
                 # Process single example
-                processed = tokenize_function({"text": [example["text"]]}, tokenizer, block_size)
-                
-                # Add to buffer
-                buffer.append({
-                    'input_ids': processed['input_ids'][0],  # Remove batch dimension
-                    'labels': processed['labels'][0],
-                    'attention_mask': processed['attention_mask'][0]
-                })
-                
-                # When buffer is full, yield all examples
-                if len(buffer) >= 1000:  # Buffer size of 1000
-                    random.shuffle(buffer)  # Shuffle before yielding
-                    for item in buffer:
-                        yield item
-                    buffer = []  # Clear buffer
+                try:
+                    processed = tokenize_function({"text": [example["text"]]}, tokenizer, block_size)
+                    
+                    # Verify tensor shapes
+                    if (processed['input_ids'].dim() == 1 and 
+                        processed['labels'].dim() == 1 and 
+                        processed['attention_mask'].dim() == 1):
+                        
+                        # Add to buffer
+                        buffer.append({
+                            'input_ids': processed['input_ids'],
+                            'labels': processed['labels'],
+                            'attention_mask': processed['attention_mask']
+                        })
+                        
+                        # When buffer is full, yield all examples
+                        if len(buffer) >= 1000:  # Buffer size of 1000
+                            random.shuffle(buffer)  # Shuffle before yielding
+                            for item in buffer:
+                                yield item
+                            buffer = []  # Clear buffer
+                except Exception as e:
+                    print(f"Error processing example: {str(e)}")
+                    continue
             
             # Yield remaining examples in buffer
             if buffer:
@@ -192,6 +198,16 @@ def train(
                 try:
                     print(f"\nAttempting to get batch at step {step}")
                     batch = next(dataset_iter)
+                    
+                    # Verify batch tensor shapes
+                    if (batch['input_ids'].dim() != 1 or 
+                        batch['labels'].dim() != 1 or 
+                        batch['attention_mask'].dim() != 1):
+                        print(f"Invalid batch shapes: input_ids={batch['input_ids'].shape}, "
+                              f"attention_mask={batch['attention_mask'].shape}, "
+                              f"labels={batch['labels'].shape}")
+                        continue
+                        
                     print(f"Successfully got batch with shapes: input_ids={batch['input_ids'].shape}, "
                           f"attention_mask={batch['attention_mask'].shape}, "
                           f"labels={batch['labels'].shape}")
@@ -227,6 +243,7 @@ def train(
             
             try:
                 print("\nMoving batch to device...")
+                # Add batch dimension since we're processing one example at a time
                 input_ids = batch['input_ids'].unsqueeze(0).to(device)
                 labels = batch['labels'].unsqueeze(0).to(device)
                 attention_mask = batch['attention_mask'].unsqueeze(0).to(device)
