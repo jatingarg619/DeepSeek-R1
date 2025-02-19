@@ -80,20 +80,25 @@ def tokenize_function(examples, tokenizer, block_size):
     attention_mask = tokenized['attention_mask']
     
     # Create input sequences and labels
-    input_ids = input_ids[:, :block_size]
-    labels = input_ids[:, 1:block_size + 1]
-    attention_mask = attention_mask[:, :block_size]
+    input_ids = input_ids[:, :block_size]  # Truncate to block_size
+    labels = input_ids[:, 1:block_size + 1]  # Next tokens as labels
+    attention_mask = attention_mask[:, :block_size]  # Match input sequence length
+    
+    # Create labels attention mask (shifted by 1 to match labels)
+    labels_attention_mask = attention_mask[:, 1:].clone()  # Shift attention mask to match labels
     
     # Ensure proper dimensions
     input_ids = input_ids.squeeze(0)
     labels = labels.squeeze(0)
     attention_mask = attention_mask.squeeze(0)
+    labels_attention_mask = labels_attention_mask.squeeze(0)
     
-    # Convert attention mask to boolean
+    # Convert attention masks to boolean
     attention_mask = attention_mask.to(torch.bool)
+    labels_attention_mask = labels_attention_mask.to(torch.bool)
     
-    # Replace padding token in labels with -100
-    labels = torch.where(attention_mask, labels, torch.tensor(-100))
+    # Replace padding token in labels with -100 using the shifted attention mask
+    labels = torch.where(labels_attention_mask, labels, torch.tensor(-100))
     
     return {
         'input_ids': input_ids,
@@ -102,18 +107,47 @@ def tokenize_function(examples, tokenizer, block_size):
     }
 
 def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
-    # Create an iterator for the streaming dataset
-    dataset = dataset.map(
-        lambda examples: tokenize_function(examples, tokenizer, block_size),
-        remove_columns=dataset.column_names,
-        batched=True
-    )
-    
-    # Convert to iterator
-    dataset = dataset.shuffle(seed=42, buffer_size=10000)
-    dataset_iter = iter(dataset)
-    
-    return dataset_iter, dataset
+    print("\nProcessing dataset...")
+    try:
+        # Create an iterator for the streaming dataset
+        processed_dataset = dataset.map(
+            lambda examples: tokenize_function(examples, tokenizer, block_size),
+            remove_columns=dataset.column_names,
+            batched=True
+        )
+        print("Dataset processed successfully")
+        
+        # Convert to iterator with buffer
+        print("Creating shuffled dataset...")
+        shuffled_dataset = processed_dataset.shuffle(
+            seed=42,
+            buffer_size=10000
+        )
+        print("Dataset shuffled successfully")
+        
+        print("Creating iterator...")
+        dataset_iter = iter(shuffled_dataset)
+        print("Iterator created successfully")
+        
+        # Verify iterator works by trying to get first batch
+        try:
+            print("Testing iterator...")
+            first_batch = next(dataset_iter)
+            print("Successfully retrieved first batch")
+            print(f"Batch shapes: input_ids={first_batch['input_ids'].shape}, "
+                  f"attention_mask={first_batch['attention_mask'].shape}, "
+                  f"labels={first_batch['labels'].shape}")
+            # Create new iterator since we consumed one batch
+            dataset_iter = iter(shuffled_dataset)
+            print("Reset iterator for training")
+        except Exception as e:
+            print(f"Error getting first batch: {str(e)}")
+            raise
+        
+        return dataset_iter, processed_dataset
+    except Exception as e:
+        print(f"Error in create_dataloader: {str(e)}")
+        raise
 
 def train(
     model: nn.Module,
@@ -160,175 +194,187 @@ def train(
             
             while retry_count < config['max_retries']:
                 try:
+                    print(f"\nAttempting to get batch at step {step}")
                     batch = next(dataset_iter)
+                    print(f"Successfully got batch with shapes: input_ids={batch['input_ids'].shape}, "
+                          f"attention_mask={batch['attention_mask'].shape}, "
+                          f"labels={batch['labels'].shape}")
                     break
                 except StopIteration:
-                    # Reset iterator when we reach the end
-                    dataset_iter = iter(dataset.shuffle(seed=step).map(
-                        lambda examples: tokenize_function(examples, tokenizer, config['block_size']),
-                        remove_columns=dataset.column_names,
-                        batched=True
-                    ))
-                    continue
+                    print("\nReached end of dataset, reshuffling...")
+                    try:
+                        # Reset iterator when we reach the end
+                        shuffled_dataset = dataset.shuffle(
+                            seed=step,
+                            buffer_size=10000
+                        ).map(
+                            lambda examples: tokenize_function(examples, tokenizer, config['block_size']),
+                            remove_columns=dataset.column_names,
+                            batched=True
+                        )
+                        dataset_iter = iter(shuffled_dataset)
+                        print("Successfully reset iterator")
+                        continue
+                    except Exception as e:
+                        print(f"Error resetting iterator: {str(e)}")
+                        raise
                 except Exception as e:
                     retry_count += 1
+                    print(f"\nError getting batch (attempt {retry_count}/{config['max_retries']}): {str(e)}")
                     if retry_count == config['max_retries']:
-                        checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
+                        raise Exception(f"Maximum retries ({config['max_retries']}) exceeded when fetching batch")
+                    
+                    wait_time = config['retry_delay'] * (2 ** (retry_count - 1))
+                    print(f"Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+            
+            if batch is None:
+                print("\nSkipping step due to None batch")
+                continue
+            
+            try:
+                print("\nMoving batch to device...")
+                input_ids = batch['input_ids'].unsqueeze(0).to(device)
+                labels = batch['labels'].unsqueeze(0).to(device)
+                attention_mask = batch['attention_mask'].unsqueeze(0).to(device)
+                print("Batch moved to device successfully")
+                
+                with autocast(device_type=device.type):
+                    logits = model(input_ids, attention_mask)
+                    
+                    if torch.isinf(logits).any():
+                        continue
+                    
+                    try:
+                        loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                    except RuntimeError:
+                        continue
+                    
+                    if torch.isnan(loss).any():
+                        continue
+                    
+                    if hasattr(model, 'layers') and hasattr(model.layers[0], 'moe'):
+                        expert_counts = torch.zeros(model.config.num_experts, device=device)
+                        hidden_states = model.embed_tokens(input_ids)
+                        
+                        for layer in model.layers:
+                            router_logits = layer.moe.gate(hidden_states)
+                            if torch.isnan(router_logits).any():
+                                continue
+                                
+                            router_probs = torch.softmax(router_logits, dim=-1)
+                            if torch.isnan(router_probs).any():
+                                continue
+                                
+                            expert_counts += router_probs.sum(dim=(0, 1))
+                        
+                        target_count = input_ids.size(0) * input_ids.size(1) / model.config.num_experts
+                        balance_loss = torch.mean((expert_counts - target_count).pow(2))
+                        aux_loss = 0.01 * balance_loss
+                        
+                        if not torch.isnan(aux_loss).any():
+                            loss += aux_loss
+                    
+                    loss = loss / gradient_accumulation_steps
+                
+                if torch.isnan(loss).any():
+                    continue
+                
+                scaler.scale(loss).backward()
+                
+                valid_gradients = True
+                for name, param in model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        valid_gradients = False
+                        break
+                
+                if not valid_gradients:
+                    optimizer.zero_grad()
+                    continue
+                
+                total_loss += loss.item()
+                
+                if (step + 1) % gradient_accumulation_steps == 0:
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
+                    
+                    if torch.isnan(grad_norm):
+                        optimizer.zero_grad()
+                        continue
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    
+                    global_step += 1
+                    
+                    avg_loss = total_loss * gradient_accumulation_steps / (step + 1)
+                    progress_bar.set_postfix({
+                        "loss": f"{avg_loss:.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.6f}",
+                        "grad_norm": f"{grad_norm:.4f}"
+                    })
+                    progress_bar.update(1)
+                    
+                    if global_step % 100 == 0:
+                        log_message = (
+                            f"\nStep {global_step}\n"
+                            f"Average Loss: {avg_loss:.4f}\n"
+                            f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
+                            f"Gradient Norm: {grad_norm:.4f}\n"
+                            + "-" * 50
+                        )
+                        log_file.write(log_message + "\n")
+                        log_file.flush()
+                        
+                        # Save checkpoint every 100 steps
+                        # Delete previous checkpoint if it exists
+                        prev_step = global_step - 100
+                        if prev_step > 0:
+                            prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
+                            if os.path.exists(prev_checkpoint):
+                                os.remove(prev_checkpoint)
+                                log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
+                        
+                        # Save new checkpoint
+                        checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
                         torch.save({
                             'step': global_step,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict(),
-                            'loss': total_loss / (step + 1) if step > 0 else 0,
+                            'loss': avg_loss,
                         }, checkpoint_path)
-                        log_file.write(f"\nMaximum retries exceeded. Saved checkpoint to {checkpoint_path}\n")
+                        log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
+                        test_generation(model, tokenizer, device, log_file)
                         log_file.flush()
-                        raise Exception(f"Maximum retries ({config['max_retries']}) exceeded when fetching batch")
                     
-                    wait_time = config['retry_delay'] * (2 ** (retry_count - 1))
-                    log_file.write(f"\nRetry {retry_count}/{config['max_retries']} after {wait_time}s. Error: {str(e)}\n")
-                    log_file.flush()
-                    time.sleep(wait_time)
-            
-            if batch is None:
+                    if global_step % config['save_steps'] == 0:
+                        # Delete previous checkpoint if it exists
+                        prev_step = global_step - config['save_steps']
+                        if prev_step > 0:
+                            prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
+                            if os.path.exists(prev_checkpoint):
+                                os.remove(prev_checkpoint)
+                                log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
+                        
+                        # Save new checkpoint
+                        checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
+                        torch.save({
+                            'step': global_step,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'loss': avg_loss,
+                        }, checkpoint_path)
+                        log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
+                        test_generation(model, tokenizer, device, log_file)
+                        log_file.flush()
+
+            except Exception as e:
+                print(f"\nError processing batch: {str(e)}")
                 continue
-            
-            input_ids = batch['input_ids'].unsqueeze(0).to(device)
-            labels = batch['labels'].unsqueeze(0).to(device)
-            attention_mask = batch['attention_mask'].unsqueeze(0).to(device)
-            
-            with autocast(device_type=device.type):
-                logits = model(input_ids, attention_mask)
-                
-                if torch.isinf(logits).any():
-                    continue
-                
-                try:
-                    loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-                except RuntimeError:
-                    continue
-                
-                if torch.isnan(loss).any():
-                    continue
-                
-                if hasattr(model, 'layers') and hasattr(model.layers[0], 'moe'):
-                    expert_counts = torch.zeros(model.config.num_experts, device=device)
-                    hidden_states = model.embed_tokens(input_ids)
-                    
-                    for layer in model.layers:
-                        router_logits = layer.moe.gate(hidden_states)
-                        if torch.isnan(router_logits).any():
-                            continue
-                            
-                        router_probs = torch.softmax(router_logits, dim=-1)
-                        if torch.isnan(router_probs).any():
-                            continue
-                            
-                        expert_counts += router_probs.sum(dim=(0, 1))
-                    
-                    target_count = input_ids.size(0) * input_ids.size(1) / model.config.num_experts
-                    balance_loss = torch.mean((expert_counts - target_count).pow(2))
-                    aux_loss = 0.01 * balance_loss
-                    
-                    if not torch.isnan(aux_loss).any():
-                        loss += aux_loss
-                
-                loss = loss / gradient_accumulation_steps
-            
-            if torch.isnan(loss).any():
-                continue
-            
-            scaler.scale(loss).backward()
-            
-            valid_gradients = True
-            for name, param in model.named_parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    valid_gradients = False
-                    break
-            
-            if not valid_gradients:
-                optimizer.zero_grad()
-                continue
-            
-            total_loss += loss.item()
-            
-            if (step + 1) % gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
-                
-                if torch.isnan(grad_norm):
-                    optimizer.zero_grad()
-                    continue
-                
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad()
-                
-                global_step += 1
-                
-                avg_loss = total_loss * gradient_accumulation_steps / (step + 1)
-                progress_bar.set_postfix({
-                    "loss": f"{avg_loss:.4f}",
-                    "lr": f"{scheduler.get_last_lr()[0]:.6f}",
-                    "grad_norm": f"{grad_norm:.4f}"
-                })
-                progress_bar.update(1)
-                
-                if global_step % 100 == 0:
-                    log_message = (
-                        f"\nStep {global_step}\n"
-                        f"Average Loss: {avg_loss:.4f}\n"
-                        f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
-                        f"Gradient Norm: {grad_norm:.4f}\n"
-                        + "-" * 50
-                    )
-                    log_file.write(log_message + "\n")
-                    log_file.flush()
-                    
-                    # Save checkpoint every 100 steps
-                    # Delete previous checkpoint if it exists
-                    prev_step = global_step - 100
-                    if prev_step > 0:
-                        prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
-                        if os.path.exists(prev_checkpoint):
-                            os.remove(prev_checkpoint)
-                            log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
-                    
-                    # Save new checkpoint
-                    checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
-                    torch.save({
-                        'step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'loss': avg_loss,
-                    }, checkpoint_path)
-                    log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
-                    test_generation(model, tokenizer, device, log_file)
-                    log_file.flush()
-                
-                if global_step % config['save_steps'] == 0:
-                    # Delete previous checkpoint if it exists
-                    prev_step = global_step - config['save_steps']
-                    if prev_step > 0:
-                        prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
-                        if os.path.exists(prev_checkpoint):
-                            os.remove(prev_checkpoint)
-                            log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
-                    
-                    # Save new checkpoint
-                    checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
-                    torch.save({
-                        'step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'loss': avg_loss,
-                    }, checkpoint_path)
-                    log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
-                    test_generation(model, tokenizer, device, log_file)
-                    log_file.flush()
 
     except Exception as e:
         error_msg = f"\nTraining interrupted at step {global_step}: {str(e)}"
