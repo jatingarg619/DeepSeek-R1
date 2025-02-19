@@ -16,6 +16,7 @@ from huggingface_hub import login
 import atexit
 import signal
 import gc
+import random
 
 # Test prompts for generation
 TEST_PROMPTS = [
@@ -109,42 +110,37 @@ def tokenize_function(examples, tokenizer, block_size):
 def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
     print("\nProcessing dataset...")
     try:
-        # Create an iterator for the streaming dataset
-        processed_dataset = dataset.map(
-            lambda examples: tokenize_function(examples, tokenizer, block_size),
-            remove_columns=dataset.column_names,
-            batched=True
-        )
-        print("Dataset processed successfully")
+        # For streaming datasets, we don't want to process everything at once
+        # Instead, we'll process batches as we go
+        def batch_iterator():
+            buffer = []
+            for example in dataset:
+                # Process single example
+                processed = tokenize_function({"text": [example["text"]]}, tokenizer, block_size)
+                
+                # Add to buffer
+                buffer.append({
+                    'input_ids': processed['input_ids'][0],  # Remove batch dimension
+                    'labels': processed['labels'][0],
+                    'attention_mask': processed['attention_mask'][0]
+                })
+                
+                # When buffer is full, yield all examples
+                if len(buffer) >= 1000:  # Buffer size of 1000
+                    random.shuffle(buffer)  # Shuffle before yielding
+                    for item in buffer:
+                        yield item
+                    buffer = []  # Clear buffer
+            
+            # Yield remaining examples in buffer
+            if buffer:
+                random.shuffle(buffer)
+                for item in buffer:
+                    yield item
         
-        # Convert to iterator with buffer
-        print("Creating shuffled dataset...")
-        shuffled_dataset = processed_dataset.shuffle(
-            seed=42,
-            buffer_size=10000
-        )
-        print("Dataset shuffled successfully")
+        print("Created streaming iterator")
+        return iter(batch_iterator()), dataset
         
-        print("Creating iterator...")
-        dataset_iter = iter(shuffled_dataset)
-        print("Iterator created successfully")
-        
-        # Verify iterator works by trying to get first batch
-        try:
-            print("Testing iterator...")
-            first_batch = next(dataset_iter)
-            print("Successfully retrieved first batch")
-            print(f"Batch shapes: input_ids={first_batch['input_ids'].shape}, "
-                  f"attention_mask={first_batch['attention_mask'].shape}, "
-                  f"labels={first_batch['labels'].shape}")
-            # Create new iterator since we consumed one batch
-            dataset_iter = iter(shuffled_dataset)
-            print("Reset iterator for training")
-        except Exception as e:
-            print(f"Error getting first batch: {str(e)}")
-            raise
-        
-        return dataset_iter, processed_dataset
     except Exception as e:
         print(f"Error in create_dataloader: {str(e)}")
         raise
@@ -201,22 +197,19 @@ def train(
                           f"labels={batch['labels'].shape}")
                     break
                 except StopIteration:
-                    print("\nReached end of dataset, reshuffling...")
+                    print("\nReached end of dataset, creating new iterator...")
                     try:
-                        # Reset iterator when we reach the end
-                        shuffled_dataset = dataset.shuffle(
-                            seed=step,
-                            buffer_size=10000
-                        ).map(
-                            lambda examples: tokenize_function(examples, tokenizer, config['block_size']),
-                            remove_columns=dataset.column_names,
-                            batched=True
+                        # Create new iterator for streaming data
+                        dataset_iter, _ = create_dataloader(
+                            dataset,
+                            tokenizer,
+                            batch_size=config['batch_size'],
+                            block_size=config['block_size']
                         )
-                        dataset_iter = iter(shuffled_dataset)
-                        print("Successfully reset iterator")
+                        print("Successfully created new iterator")
                         continue
                     except Exception as e:
-                        print(f"Error resetting iterator: {str(e)}")
+                        print(f"Error creating new iterator: {str(e)}")
                         raise
                 except Exception as e:
                     retry_count += 1
