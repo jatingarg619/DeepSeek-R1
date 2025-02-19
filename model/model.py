@@ -8,7 +8,7 @@ import torch.nn.functional as F
 @dataclass
 class DeepSeekConfig:
     vocab_size: int = 49152
-    hidden_size: int = 768
+    hidden_size: int = 576
     intermediate_size: int = 1536
     num_hidden_layers: int = 30
     num_attention_heads: int = 9
@@ -24,10 +24,8 @@ class DeepSeekConfig:
     tie_word_embeddings: bool = True
     rope_theta: float = 10000.0
     num_experts: int = 8
-    num_shared_experts: int = 1
     num_experts_per_token: int = 2
     expert_capacity_factor: float = 1.25
-    compression_ratio: int = 8  # For MLHA
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-5):
@@ -61,30 +59,26 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs: torch.Tensor):
 class MultiheadLinearAttention(nn.Module):
     def __init__(self, config: DeepSeekConfig):
         super().__init__()
-        self.hidden_size = config.hidden_size  # 765
-        self.num_heads = config.num_attention_heads  # 9
-        self.num_kv_heads = config.num_key_value_heads  # 3
-        self.head_dim = config.hidden_size // config.num_attention_heads  # 765 // 9 = 85
-        
-        # Ensure latent_dim is consistent
-        self.latent_dim = self.head_dim // config.compression_ratio  # 85 // 2 = 42
-        
-        print(f"Attention dimensions: hidden_size={self.hidden_size}, "
-              f"num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, "
-              f"head_dim={self.head_dim}, latent_dim={self.latent_dim}")
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.latent_dim = self.head_dim // 4  # Reduced dimension for latent space
         
         # Query, Key, Value projections
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         
-        # Latent projections with consistent dimensions
+        # Latent projections
         self.q_latent = nn.Linear(self.head_dim, self.latent_dim, bias=False)
         self.k_latent = nn.Linear(self.head_dim, self.latent_dim, bias=False)
         self.v_latent = nn.Linear(self.head_dim, self.latent_dim, bias=False)
         
-        # Output projections
+        # New projection from latent space back to head_dim
         self.lat_out_proj = nn.Linear(self.latent_dim, self.head_dim, bias=False)
+        
+        # Output projection
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
         
         # Layer norm for latent space
@@ -104,11 +98,11 @@ class MultiheadLinearAttention(nn.Module):
         batch_size, seq_length, _ = hidden_states.size()
         
         # Project to Q, K, V
-        q = self.q_proj(hidden_states)  # [batch, seq, num_heads * head_dim]
-        k = self.k_proj(hidden_states)  # [batch, seq, num_kv_heads * head_dim]
-        v = self.v_proj(hidden_states)  # [batch, seq, num_kv_heads * head_dim]
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
         
-        # Reshape to [batch, seq, heads, head_dim]
+        # Reshape to [batch, seq, num_heads, head_dim] or [batch, seq, num_kv_heads, head_dim]
         q = q.view(batch_size, seq_length, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, seq_length, self.num_kv_heads, self.head_dim)
@@ -117,28 +111,15 @@ class MultiheadLinearAttention(nn.Module):
         q = apply_rotary_embeddings(q, self.rope_freqs[:seq_length])
         k = apply_rotary_embeddings(k, self.rope_freqs[:seq_length])
         
-        # Handle grouped query attention - repeat KV heads
+        # Handle grouped query attention
         if self.num_kv_heads < self.num_heads:
-            # Compute repeat factor
-            repeat_factor = self.num_heads // self.num_kv_heads  # 9 // 3 = 3
-            # Repeat k and v for each query head
-            k = k.repeat_interleave(repeat_factor, dim=2)  # [batch, seq, num_heads, head_dim]
-            v = v.repeat_interleave(repeat_factor, dim=2)  # [batch, seq, num_heads, head_dim]
+            k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2)
+            v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=2)
         
         # Project to latent space
-        q = q.view(-1, self.head_dim)  # [(batch * seq * num_heads), head_dim]
-        k = k.view(-1, self.head_dim)  # [(batch * seq * num_heads), head_dim]
-        v = v.view(-1, self.head_dim)  # [(batch * seq * num_heads), head_dim]
-        
-        # Apply latent projections
-        q_latent = self.q_latent(q)  # [(batch * seq * num_heads), latent_dim]
-        k_latent = self.k_latent(k)  # [(batch * seq * num_heads), latent_dim]
-        v_latent = self.v_latent(v)  # [(batch * seq * num_heads), latent_dim]
-        
-        # Reshape back to [batch, seq, heads, latent_dim]
-        q_latent = q_latent.view(batch_size, seq_length, self.num_heads, self.latent_dim)
-        k_latent = k_latent.view(batch_size, seq_length, self.num_heads, self.latent_dim)
-        v_latent = v_latent.view(batch_size, seq_length, self.num_heads, self.latent_dim)
+        q_latent = self.q_latent(q)  # [batch, seq, heads, latent_dim]
+        k_latent = self.k_latent(k)  # [batch, seq, heads, latent_dim]
+        v_latent = self.v_latent(v)  # [batch, seq, heads, latent_dim]
         
         # Apply layer norm in latent space
         q_latent = self.latent_norm(q_latent)
@@ -146,36 +127,40 @@ class MultiheadLinearAttention(nn.Module):
         v_latent = self.latent_norm(v_latent)
         
         # Rearrange for attention computation
-        q_latent = q_latent.transpose(1, 2)  # [batch, num_heads, seq, latent_dim]
-        k_latent = k_latent.transpose(1, 2)  # [batch, num_heads, seq, latent_dim]
-        v_latent = v_latent.transpose(1, 2)  # [batch, num_heads, seq, latent_dim]
+        q_latent = q_latent.transpose(1, 2)  # [batch, heads, seq, latent_dim]
+        k_latent = k_latent.transpose(1, 2)  # [batch, heads, seq, latent_dim]
+        v_latent = v_latent.transpose(1, 2)  # [batch, heads, seq, latent_dim]
         
         # Linear attention in latent space
+        # Use ELU activation for positive features
         q_latent = F.elu(q_latent) + 1
         k_latent = F.elu(k_latent) + 1
         
         # Compute attention in linear space
-        kv = torch.matmul(k_latent.transpose(-2, -1), v_latent)  # [batch, num_heads, latent_dim, latent_dim]
-        qkv = torch.matmul(q_latent, kv)  # [batch, num_heads, seq, latent_dim]
+        kv = torch.matmul(k_latent.transpose(-2, -1), v_latent)  # [batch, heads, latent_dim, head_dim]
+        qkv = torch.matmul(q_latent, kv)  # [batch, heads, seq, latent_dim]
         
         # Scale by sequence length for stability
         qkv = qkv / seq_length
         
         # Handle attention mask
         if attention_mask is not None:
-            attention_mask = attention_mask.view(batch_size, 1, seq_length, 1)
-            attention_mask = attention_mask.expand(-1, self.num_heads, -1, -1)
+            # Reshape attention mask to match qkv dimensions
+            attention_mask = attention_mask.view(batch_size, 1, seq_length)  # [batch, 1, seq]
+            attention_mask = attention_mask.expand(-1, self.num_heads, -1)  # [batch, heads, seq]
+            attention_mask = attention_mask.unsqueeze(-1)  # [batch, heads, seq, 1]
             qkv = qkv.masked_fill(~attention_mask, 0.0)
         
-        # Project back to head_dim
-        qkv = qkv.transpose(1, 2).contiguous()  # [batch, seq, num_heads, latent_dim]
-        qkv = qkv.view(-1, self.latent_dim)  # [(batch * seq * num_heads), latent_dim]
-        qkv = self.lat_out_proj(qkv)  # [(batch * seq * num_heads), head_dim]
-        qkv = qkv.view(batch_size, seq_length, self.num_heads, self.head_dim)
+        # Project from latent space to head_dim
+        qkv = self.lat_out_proj(qkv)  # Now shape becomes [batch, heads, seq, head_dim]
         
-        # Final output projection
+        # Reshape for output projection: [batch, seq, num_heads * head_dim]
+        qkv = qkv.transpose(1, 2).contiguous()  # [batch, seq, heads, head_dim]
         qkv = qkv.view(batch_size, seq_length, self.num_heads * self.head_dim)
-        return self.o_proj(qkv)
+        
+        # Project back to hidden size
+        output = self.o_proj(qkv)  # [batch, seq, hidden_size]
+        return output
 
 class ExpertMLP(nn.Module):
     def __init__(self, config: DeepSeekConfig):
