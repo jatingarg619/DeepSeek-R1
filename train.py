@@ -358,18 +358,30 @@ def main():
     }
     
     # Check for existing checkpoints
-    checkpoints = sorted([
-        int(f.split('_')[1].split('.')[0])
-        for f in os.listdir('checkpoints')
-        if f.startswith('model_step_') and f.endswith('.pt')
-    ], reverse=True)
-    
-    if checkpoints:
-        latest_step = checkpoints[0]
-        print(f"\nFound existing checkpoint at step {latest_step}")
-        user_input = input("Would you like to resume from this checkpoint? (y/n): ")
-        if user_input.lower() == 'y':
-            config['resume_from'] = latest_step
+    try:
+        checkpoints = []
+        if os.path.exists('checkpoints'):
+            for f in os.listdir('checkpoints'):
+                if f.startswith('model_step_') and f.endswith('.pt'):
+                    try:
+                        # Extract step number, handling both model_step_X.pt and other formats
+                        step_num = int(''.join(filter(str.isdigit, f)))
+                        checkpoints.append(step_num)
+                    except ValueError:
+                        continue
+        
+        checkpoints.sort(reverse=True)
+        
+        if checkpoints:
+            latest_step = checkpoints[0]
+            print(f"\nFound existing checkpoint at step {latest_step}")
+            user_input = input("Would you like to resume from this checkpoint? (y/n): ")
+            if user_input.lower() == 'y':
+                config['resume_from'] = latest_step
+    except Exception as e:
+        print(f"\nWarning: Error checking checkpoints: {str(e)}")
+        print("Starting from beginning...")
+        config['resume_from'] = 0
     
     # Set random seed
     torch.manual_seed(config['seed'])
