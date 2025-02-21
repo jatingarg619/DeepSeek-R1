@@ -422,16 +422,16 @@ def main():
     
     # Training configuration
     config = {
-        'batch_size': 16,              # Increased from 4 for better GPU utilization
-        'gradient_accumulation_steps': 4,  # Reduced from 8 since we increased batch size
+        'batch_size': 16,
+        'gradient_accumulation_steps': 4,
         'learning_rate': 1e-4,
         'weight_decay': 0.01,
         'max_steps': 10000,
         'warmup_steps': 500,
-        'save_steps': 500,            # Changed from 1000 to 500
+        'save_steps': 500,
         'seed': 42,
         'max_grad_norm': 0.5,
-        'resume_from': 0,
+        'resume_from': 0,  # This will be updated if we find a checkpoint
         'block_size': 512,
         'max_retries': 10,
         'retry_delay': 5,
@@ -443,6 +443,7 @@ def main():
     
     try:
         # Check for existing checkpoints
+        print("\nChecking for existing checkpoints...")
         checkpoints = []
         if os.path.exists('checkpoints'):
             for f in os.listdir('checkpoints'):
@@ -456,15 +457,15 @@ def main():
                 except (ValueError, IndexError):
                     continue
         
-        # Sort by step number
-        checkpoints.sort(key=lambda x: x[0], reverse=True)
-        
+        # Sort by step number and automatically use the latest checkpoint
         if checkpoints:
+            checkpoints.sort(key=lambda x: x[0], reverse=True)
             latest_step, latest_file = checkpoints[0]
-            print(f"\nFound existing checkpoint at step {latest_step} ({latest_file})")
-            user_input = input("Would you like to resume from this checkpoint? (y/n): ")
-            if user_input.lower() == 'y':
-                config['resume_from'] = latest_step
+            print(f"\nFound latest checkpoint at step {latest_step} ({latest_file})")
+            print(f"Automatically resuming from step {latest_step}")
+            config['resume_from'] = latest_step
+        else:
+            print("\nNo existing checkpoints found. Starting from step 0.")
         
         # Set random seed
         torch.manual_seed(config['seed'])
