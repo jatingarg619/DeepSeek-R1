@@ -105,11 +105,14 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             return_tensors='pt'
         )
         
-        input_ids = tokenized['input_ids']
-        labels = input_ids.clone()
-        attention_mask = tokenized['attention_mask']
+        # Properly clone and detach tensors
+        input_ids = tokenized['input_ids'].clone().detach()
+        attention_mask = tokenized['attention_mask'].clone().detach()
         
-        # Shift labels
+        # Create labels by shifting input_ids
+        labels = input_ids.clone()
+        
+        # Shift for next token prediction
         labels = labels[:, 1:]
         input_ids = input_ids[:, :-1]
         attention_mask = attention_mask[:, :-1]
@@ -126,15 +129,21 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             'attention_mask': attention_mask
         }
     
-    # For streaming datasets, we don't use DataLoader's batching
-    # Instead, we let the dataset handle the streaming and batching
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        remove_columns=dataset.column_names,
-        batched=True
-    ).with_format("torch")
+    # Create a batched dataset
+    def batch_sampler(dataset, batch_size):
+        buffer = []
+        for example in dataset:
+            buffer.append(example)
+            if len(buffer) == batch_size:
+                batch = tokenize_function({'text': [ex['text'] for ex in buffer]})
+                yield batch
+                buffer = []
+        if buffer:
+            batch = tokenize_function({'text': [ex['text'] for ex in buffer]})
+            yield batch
     
-    return tokenized_dataset
+    # Return an iterator that yields batches
+    return batch_sampler(dataset, batch_size)
 
 def train(
     model: nn.Module,
@@ -176,123 +185,90 @@ def train(
     log_file.write("\nStarting training loop...\n")
     
     try:
-        # Create initial dataset iterator
-        data_iterator = iter(dataset)
-        log_file.write("Created initial dataset iterator\n")
-        
         while global_step < config['max_steps']:
-            log_file.write(f"\nProcessing step {global_step + 1}...\n")
+            # Create new iterator for each epoch
+            data_iterator = dataset
             
-            # Try to get next batch with retries
-            batch = None
-            retry_count = 0
-            
-            while batch is None and retry_count < config['max_retries']:
-                try:
-                    batch = next(data_iterator)
+            for batch in data_iterator:
+                if global_step >= config['max_steps']:
                     break
-                except StopIteration:
-                    # Reset iterator if we reach the end
-                    log_file.write("Reached end of dataset, creating new iterator\n")
-                    data_iterator = iter(dataset)
-                    retry_count += 1
-                except Exception as e:
-                    log_file.write(f"Error fetching batch: {str(e)}\n")
-                    retry_count += 1
-                    time.sleep(config['retry_delay'])
-            
-            if batch is None:
-                log_file.write("Failed to get batch after retries, saving checkpoint and exiting\n")
-                # Save interrupted checkpoint
-                checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
-                torch.save({
-                    'step': global_step,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'loss': total_loss / (accumulated_steps if accumulated_steps > 0 else 1),
-                }, checkpoint_path)
-                return False
-            
-            # Process the batch
-            try:
-                # Move batch to device
-                input_ids = batch['input_ids'].to(device)
-                labels = batch['labels'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                
-                # Log shapes for debugging
-                log_file.write(f"Batch shapes - ids: {input_ids.shape}, labels: {labels.shape}, mask: {attention_mask.shape}\n")
-                
-                with autocast(device_type=device.type):
-                    # Forward pass
-                    logits = model(input_ids, attention_mask)
-                    log_file.write(f"Forward pass complete. Logits shape: {logits.shape}\n")
                     
-                    # Calculate loss
-                    loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-                    loss = loss / gradient_accumulation_steps
+                try:
+                    # Move batch to device
+                    input_ids = batch['input_ids'].to(device)
+                    labels = batch['labels'].to(device)
+                    attention_mask = batch['attention_mask'].to(device)
                     
-                    if not torch.isnan(loss).any() and not torch.isinf(loss).any():
-                        # Backward pass
-                        scaler.scale(loss).backward()
-                        log_file.write(f"Backward pass complete. Loss: {loss.item()}\n")
+                    # Log shapes for debugging
+                    log_file.write(f"Batch shapes - ids: {input_ids.shape}, labels: {labels.shape}, mask: {attention_mask.shape}\n")
+                    
+                    with autocast(device_type=device.type):
+                        # Forward pass
+                        logits = model(input_ids, attention_mask)
                         
-                        total_loss += loss.item()
-                        accumulated_steps += 1
+                        # Calculate loss
+                        loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                        loss = loss / gradient_accumulation_steps
                         
-                        if accumulated_steps % gradient_accumulation_steps == 0:
-                            # Optimizer step
-                            scaler.unscale_(optimizer)
-                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
+                        if not torch.isnan(loss).any() and not torch.isinf(loss).any():
+                            # Backward pass
+                            scaler.scale(loss).backward()
                             
-                            if not torch.isnan(grad_norm):
-                                scaler.step(optimizer)
-                                scaler.update()
-                                scheduler.step()
-                                optimizer.zero_grad()
+                            total_loss += loss.item()
+                            accumulated_steps += 1
+                            
+                            if accumulated_steps % gradient_accumulation_steps == 0:
+                                # Optimizer step
+                                scaler.unscale_(optimizer)
+                                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
                                 
-                                global_step += 1
-                                
-                                # Update progress
-                                avg_loss = total_loss / accumulated_steps
-                                progress_bar.set_postfix({
-                                    "loss": f"{avg_loss:.4f}",
-                                    "lr": f"{scheduler.get_last_lr()[0]:.6f}",
-                                    "grad_norm": f"{grad_norm:.4f}"
-                                })
-                                progress_bar.update(1)
-                                
-                                # Logging
-                                if global_step % 10 == 0:
-                                    log_file.write(
-                                        f"\nStep {global_step} stats:\n"
-                                        f"Average Loss: {avg_loss:.4f}\n"
-                                        f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
-                                        f"Gradient Norm: {grad_norm:.4f}\n"
-                                    )
-                                    log_file.flush()
-                                
-                                # Save checkpoint if needed
-                                if global_step % 100 == 0:
-                                    checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
-                                    torch.save({
-                                        'step': global_step,
-                                        'model_state_dict': model.state_dict(),
-                                        'optimizer_state_dict': optimizer.state_dict(),
-                                        'scheduler_state_dict': scheduler.state_dict(),
-                                        'loss': avg_loss,
-                                    }, checkpoint_path)
-                                    log_file.write(f"\nSaved checkpoint: {checkpoint_path}\n")
-                                    log_file.flush()
-                    else:
-                        log_file.write(f"Skipping step due to invalid loss: {loss.item()}\n")
-                        optimizer.zero_grad()
-                
-            except Exception as e:
-                log_file.write(f"Error processing batch: {str(e)}\n")
-                log_file.flush()
-                continue
+                                if not torch.isnan(grad_norm):
+                                    scaler.step(optimizer)
+                                    scaler.update()
+                                    scheduler.step()
+                                    optimizer.zero_grad()
+                                    
+                                    global_step += 1
+                                    
+                                    # Update progress
+                                    avg_loss = total_loss / accumulated_steps
+                                    progress_bar.set_postfix({
+                                        "loss": f"{avg_loss:.4f}",
+                                        "lr": f"{scheduler.get_last_lr()[0]:.6f}",
+                                        "grad_norm": f"{grad_norm:.4f}"
+                                    })
+                                    progress_bar.update(1)
+                                    
+                                    # Logging
+                                    if global_step % 10 == 0:
+                                        log_file.write(
+                                            f"\nStep {global_step} stats:\n"
+                                            f"Average Loss: {avg_loss:.4f}\n"
+                                            f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
+                                            f"Gradient Norm: {grad_norm:.4f}\n"
+                                        )
+                                        log_file.flush()
+                                    
+                                    # Save checkpoint if needed
+                                    if global_step % 100 == 0:
+                                        checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
+                                        torch.save({
+                                            'step': global_step,
+                                            'model_state_dict': model.state_dict(),
+                                            'optimizer_state_dict': optimizer.state_dict(),
+                                            'scheduler_state_dict': scheduler.state_dict(),
+                                            'loss': avg_loss,
+                                        }, checkpoint_path)
+                                        log_file.write(f"\nSaved checkpoint: {checkpoint_path}\n")
+                                        log_file.flush()
+                        else:
+                            log_file.write(f"Skipping step due to invalid loss: {loss.item()}\n")
+                            optimizer.zero_grad()
+                    
+                except Exception as e:
+                    log_file.write(f"Error processing batch: {str(e)}\n")
+                    log_file.flush()
+                    continue
         
         log_file.write("\nTraining completed successfully!\n")
         return True
