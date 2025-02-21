@@ -175,12 +175,30 @@ def train(
     progress_bar = tqdm(total=config['max_steps'], initial=resume_from)
     
     try:
+        # Create a proper iterator for the dataset
+        data_iterator = iter(dataset)
+        
         while global_step < config['max_steps']:
             retry_count = 0
+            batch = None
+            
+            # Try to get next batch with retries
             while retry_count < config['max_retries']:
                 try:
-                    batch = next(iter(dataset))
+                    batch = next(data_iterator)
                     break
+                except StopIteration:
+                    # If we reach the end of the iterator, create a new one
+                    data_iterator = iter(dataset)
+                    try:
+                        batch = next(data_iterator)
+                        break
+                    except Exception as e:
+                        retry_count += 1
+                        wait_time = config['retry_delay'] * (2 ** (retry_count - 1))
+                        log_file.write(f"\nRetry {retry_count}/{config['max_retries']} after {wait_time}s. Error: {str(e)}\n")
+                        log_file.flush()
+                        time.sleep(wait_time)
                 except Exception as e:
                     retry_count += 1
                     if retry_count == config['max_retries']:
@@ -201,9 +219,19 @@ def train(
                     log_file.flush()
                     time.sleep(wait_time)
             
-            input_ids = batch['input_ids'].unsqueeze(0).to(device)
-            labels = batch['labels'].unsqueeze(0).to(device)
-            attention_mask = batch['attention_mask'].unsqueeze(0).to(device)
+            if batch is None:
+                continue
+            
+            # Move batch to device
+            input_ids = batch['input_ids'].to(device)
+            labels = batch['labels'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            
+            # Remove extra dimension if present
+            if input_ids.dim() == 3:
+                input_ids = input_ids.squeeze(0)
+                labels = labels.squeeze(0)
+                attention_mask = attention_mask.squeeze(0)
             
             with autocast(device_type=device.type):
                 logits = model(input_ids, attention_mask)
