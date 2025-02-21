@@ -149,15 +149,27 @@ def train(
     download_config=None
 ):
     # Enable CUDA optimizations
-    torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
-    torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster training
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     
+    # Create directories if they don't exist
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
     os.makedirs("logs/training", exist_ok=True)
     
-    log_file = open("logs/training/training_log.txt", "a")
+    # Open log file with timestamp
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    log_file = open(f"logs/training/training_log_{timestamp}.txt", "a")
     log_file.write("\n" + "="*50 + "\nNew Training Run\n" + "="*50 + "\n")
+    log_file.write(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    # Log configuration
+    log_file.write("\nTraining Configuration:\n")
+    for k, v in config.items():
+        log_file.write(f"{k}: {v}\n")
+    log_file.write("="*50 + "\n")
+    log_file.flush()
     
     if resume_from > 0:
         log_file.write(f"\nResuming training from step {resume_from}\n")
@@ -168,6 +180,8 @@ def train(
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             log_file.write(f"Loaded checkpoint from {checkpoint_path}\n")
+            log_file.write(f"Previous loss: {checkpoint.get('loss', 'unknown')}\n")
+            log_file.flush()
     
     model.train()
     criterion = nn.CrossEntropyLoss()
@@ -175,6 +189,7 @@ def train(
     global_step = resume_from
     gradient_accumulation_steps = config['gradient_accumulation_steps']
     total_loss = 0
+    last_log_time = time.time()
     
     progress_bar = tqdm(range(resume_from, config['max_steps']))
     
@@ -298,48 +313,35 @@ def train(
                 optimizer.zero_grad()
                 
                 global_step += 1
+                current_time = time.time()
+                time_per_step = (current_time - last_log_time) / gradient_accumulation_steps
                 
                 avg_loss = total_loss * gradient_accumulation_steps / (step + 1)
+                
+                # Update progress bar and log
                 progress_bar.set_postfix({
                     "loss": f"{avg_loss:.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.6f}",
-                    "grad_norm": f"{grad_norm:.4f}"
+                    "grad_norm": f"{grad_norm:.4f}",
+                    "time/step": f"{time_per_step:.2f}s"
                 })
                 progress_bar.update(1)
                 
+                # Log every 100 steps
                 if global_step % 100 == 0:
                     log_message = (
-                        f"\nStep {global_step}\n"
+                        f"\nStep {global_step} "
+                        f"(Time: {time.strftime('%Y-%m-%d %H:%M:%S')})\n"
                         f"Average Loss: {avg_loss:.4f}\n"
                         f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
                         f"Gradient Norm: {grad_norm:.4f}\n"
+                        f"Time per step: {time_per_step:.2f}s\n"
                         + "-" * 50
                     )
                     log_file.write(log_message + "\n")
                     log_file.flush()
-                    
-                    # Save checkpoint every 100 steps
-                    # Delete previous checkpoint if it exists
-                    prev_step = global_step - 100
-                    if prev_step > 0:
-                        prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
-                        if os.path.exists(prev_checkpoint):
-                            os.remove(prev_checkpoint)
-                            log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
-                    
-                    # Save new checkpoint
-                    checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
-                    torch.save({
-                        'step': global_step,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'loss': avg_loss,
-                    }, checkpoint_path)
-                    log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
-                    test_generation(model, tokenizer, device, log_file)
-                    log_file.flush()
                 
+                # Save checkpoint every save_steps
                 if global_step % config['save_steps'] == 0:
                     # Delete previous checkpoint if it exists
                     prev_step = global_step - config['save_steps']
@@ -351,16 +353,23 @@ def train(
                     
                     # Save new checkpoint
                     checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
-                    torch.save({
+                    checkpoint_data = {
                         'step': global_step,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': avg_loss,
-                    }, checkpoint_path)
+                        'config': config,
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    torch.save(checkpoint_data, checkpoint_path)
                     log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
+                    
+                    # Run test generation
                     test_generation(model, tokenizer, device, log_file)
                     log_file.flush()
+                
+                last_log_time = current_time
 
     except Exception as e:
         error_msg = f"\nTraining interrupted at step {global_step}: {str(e)}"
@@ -419,7 +428,7 @@ def main():
         'weight_decay': 0.01,
         'max_steps': 10000,
         'warmup_steps': 500,
-        'save_steps': 1000,
+        'save_steps': 500,            # Changed from 1000 to 500
         'seed': 42,
         'max_grad_norm': 0.5,
         'resume_from': 0,
@@ -427,9 +436,9 @@ def main():
         'max_retries': 10,
         'retry_delay': 5,
         'timeout': 30,
-        'num_workers': 4,              # Added for parallel data loading
-        'prefetch_factor': 2,          # Added for data prefetching
-        'pin_memory': True             # Added for faster data transfer to GPU
+        'num_workers': 4,
+        'prefetch_factor': 2,
+        'pin_memory': True
     }
     
     try:
