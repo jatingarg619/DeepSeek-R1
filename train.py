@@ -94,56 +94,98 @@ def test_generation(model, tokenizer, device, log_file):
     log_file.write("\n" + "="*50 + "\n")
     log_file.flush()
 
-def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
+def create_dataloader(dataset, tokenizer, batch_size, block_size=2048):
+    """Create a robust data iterator with better error handling and batch management."""
+    
     def tokenize_function(examples):
-        text = examples['text']
-        tokenized = tokenizer(
-            text, 
-            truncation=True,
-            max_length=block_size,
-            padding='max_length',
-            return_tensors='pt'
-        )
-        
-        # Properly clone and detach tensors
-        input_ids = tokenized['input_ids'].clone().detach()
-        attention_mask = tokenized['attention_mask'].clone().detach()
-        
-        # Create labels by shifting input_ids
-        labels = input_ids.clone()
-        
-        # Shift for next token prediction
-        labels = labels[:, 1:]
-        input_ids = input_ids[:, :-1]
-        attention_mask = attention_mask[:, :-1]
-        
-        # Convert attention mask to boolean
-        attention_mask = attention_mask.bool()
-        
-        # Create labels with -100 for masked positions
-        labels = torch.where(attention_mask, labels, -100)
-        
-        return {
-            'input_ids': input_ids,
-            'labels': labels,
-            'attention_mask': attention_mask
-        }
+        try:
+            # Ensure text is a string
+            text = str(examples['text'])
+            
+            # Tokenize with safety checks
+            tokenized = tokenizer(
+                text,
+                truncation=True,
+                max_length=block_size,
+                padding='max_length',
+                return_tensors='pt'
+            )
+            
+            # Get tensors and ensure they're on CPU
+            input_ids = tokenized['input_ids'].squeeze(0)
+            attention_mask = tokenized['attention_mask'].squeeze(0)
+            
+            # Create labels by shifting input_ids
+            labels = input_ids.clone()
+            labels = labels[1:]
+            input_ids = input_ids[:-1]
+            attention_mask = attention_mask[:-1]
+            
+            # Ensure all tensors have the same length
+            min_len = min(input_ids.size(0), labels.size(0), attention_mask.size(0))
+            input_ids = input_ids[:min_len]
+            labels = labels[:min_len]
+            attention_mask = attention_mask[:min_len]
+            
+            return {
+                'input_ids': input_ids,
+                'labels': labels,
+                'attention_mask': attention_mask
+            }
+        except Exception as e:
+            print(f"Error in tokenize_function: {str(e)}")
+            return None
     
-    # Create a batched dataset
-    def batch_sampler(dataset, batch_size):
+    def batch_sampler():
         buffer = []
-        for example in dataset:
-            buffer.append(example)
-            if len(buffer) == batch_size:
-                batch = tokenize_function({'text': [ex['text'] for ex in buffer]})
-                yield batch
-                buffer = []
-        if buffer:
-            batch = tokenize_function({'text': [ex['text'] for ex in buffer]})
-            yield batch
+        try:
+            for example in dataset:
+                try:
+                    # Process the example
+                    processed = tokenize_function(example)
+                    if processed is not None:
+                        buffer.append(processed)
+                    
+                    # When we have enough examples, yield a batch
+                    if len(buffer) == batch_size:
+                        # Stack tensors into a batch
+                        batch = {
+                            'input_ids': torch.stack([b['input_ids'] for b in buffer]),
+                            'labels': torch.stack([b['labels'] for b in buffer]),
+                            'attention_mask': torch.stack([b['attention_mask'] for b in buffer])
+                        }
+                        yield batch
+                        buffer = []
+                except Exception as e:
+                    print(f"Error processing example: {str(e)}")
+                    continue
+            
+            # Don't forget the last partial batch
+            if buffer:
+                try:
+                    batch = {
+                        'input_ids': torch.stack([b['input_ids'] for b in buffer]),
+                        'labels': torch.stack([b['labels'] for b in buffer]),
+                        'attention_mask': torch.stack([b['attention_mask'] for b in buffer])
+                    }
+                    yield batch
+                except Exception as e:
+                    print(f"Error processing final batch: {str(e)}")
+        except Exception as e:
+            print(f"Error in batch_sampler: {str(e)}")
+            # Yield any valid batches we have
+            if buffer:
+                try:
+                    batch = {
+                        'input_ids': torch.stack([b['input_ids'] for b in buffer]),
+                        'labels': torch.stack([b['labels'] for b in buffer]),
+                        'attention_mask': torch.stack([b['attention_mask'] for b in buffer])
+                    }
+                    yield batch
+                except Exception as e:
+                    print(f"Error processing emergency batch: {str(e)}")
     
-    # Return an iterator that yields batches
-    return batch_sampler(dataset, batch_size)
+    return batch_sampler()
 
 def train(
     model: nn.Module,
@@ -184,23 +226,47 @@ def train(
     progress_bar = tqdm(total=config['max_steps'], initial=resume_from)
     log_file.write("\nStarting training loop...\n")
     
+    # Initialize data iterator
+    data_iterator = None
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
     try:
         while global_step < config['max_steps']:
-            # Create new iterator for each epoch
-            data_iterator = dataset
-            
-            for batch in data_iterator:
-                if global_step >= config['max_steps']:
-                    break
-                    
+            try:
+                # Create or recreate iterator if needed
+                if data_iterator is None:
+                    data_iterator = dataset()
+                
+                # Get next batch with timeout
+                try:
+                    batch = next(data_iterator)
+                except StopIteration:
+                    log_file.write("\nReached end of dataset, creating new iterator\n")
+                    data_iterator = dataset()
+                    batch = next(data_iterator)
+                except Exception as e:
+                    log_file.write(f"\nError getting batch: {str(e)}\n")
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        raise Exception(f"Too many consecutive errors ({max_consecutive_errors})")
+                    time.sleep(1)  # Brief pause before retry
+                    continue
+                
+                # Reset error counter on successful batch
+                consecutive_errors = 0
+                
+                # Process batch
                 try:
                     # Move batch to device
                     input_ids = batch['input_ids'].to(device)
                     labels = batch['labels'].to(device)
                     attention_mask = batch['attention_mask'].to(device)
                     
-                    # Log shapes for debugging
-                    log_file.write(f"Batch shapes - ids: {input_ids.shape}, labels: {labels.shape}, mask: {attention_mask.shape}\n")
+                    # Verify tensor shapes
+                    if input_ids.size(0) != config['batch_size'] or input_ids.size(1) != config['block_size'] - 1:
+                        log_file.write(f"\nUnexpected batch shape: {input_ids.shape}\n")
+                        continue
                     
                     with autocast(device_type=device.type):
                         # Forward pass
@@ -261,14 +327,48 @@ def train(
                                         }, checkpoint_path)
                                         log_file.write(f"\nSaved checkpoint: {checkpoint_path}\n")
                                         log_file.flush()
+                                        
+                                        # Delete old checkpoint
+                                        prev_step = global_step - 100
+                                        if prev_step > 0:
+                                            prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
+                                            if os.path.exists(prev_checkpoint):
+                                                os.remove(prev_checkpoint)
+                                                log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
                         else:
-                            log_file.write(f"Skipping step due to invalid loss: {loss.item()}\n")
+                            log_file.write(f"\nSkipping step due to invalid loss: {loss.item()}\n")
                             optimizer.zero_grad()
+                            
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        if hasattr(torch.cuda, 'empty_cache'):
+                            torch.cuda.empty_cache()
+                        log_file.write(f"\nCUDA out of memory: {str(e)}\n")
+                        continue
+                    raise e
                     
-                except Exception as e:
-                    log_file.write(f"Error processing batch: {str(e)}\n")
-                    log_file.flush()
-                    continue
+            except Exception as e:
+                log_file.write(f"\nError in training loop: {str(e)}\n")
+                log_file.flush()
+                
+                # Save emergency checkpoint
+                emergency_checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_emergency.pt')
+                try:
+                    torch.save({
+                        'step': global_step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': total_loss / (accumulated_steps if accumulated_steps > 0 else 1),
+                    }, emergency_checkpoint_path)
+                    log_file.write(f"\nSaved emergency checkpoint: {emergency_checkpoint_path}\n")
+                except Exception as save_error:
+                    log_file.write(f"\nFailed to save emergency checkpoint: {str(save_error)}\n")
+                
+                # Reset iterator
+                data_iterator = None
+                time.sleep(1)  # Brief pause before continuing
+                continue
         
         log_file.write("\nTraining completed successfully!\n")
         return True
