@@ -121,14 +121,14 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             'attention_mask': attention_mask.pin_memory() if torch.cuda.is_available() else attention_mask
         }
     
-    # Use DataLoader for better batching and parallelization
+    # For streaming dataset, we map without num_proc
     tokenized_dataset = dataset.map(
         tokenize_function,
         remove_columns=dataset.column_names,
-        batched=True,
-        num_proc=num_workers
+        batched=True
     )
     
+    # Create DataLoader with appropriate settings for streaming
     return DataLoader(
         tokenized_dataset,
         batch_size=batch_size,
