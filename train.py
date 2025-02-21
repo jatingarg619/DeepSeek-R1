@@ -16,6 +16,7 @@ from huggingface_hub import login
 import atexit
 import signal
 import gc
+import sys
 
 # Test prompts for generation
 TEST_PROMPTS = [
@@ -95,7 +96,6 @@ def test_generation(model, tokenizer, device, log_file):
 
 def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
     def tokenize_function(examples):
-        # Use the text field from Cosmopedia dataset
         text = examples['text']
         tokenized = tokenizer(
             text, 
@@ -105,36 +105,37 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             return_tensors='pt'
         )
         
-        # Create input and target sequences
         input_ids = tokenized['input_ids'][:, :-1]
         labels = tokenized['input_ids'][:, 1:]
         attention_mask = tokenized['attention_mask'][:, :-1]
         
-        # Ensure proper dimensions
         input_ids = input_ids.squeeze(0)
         labels = labels.squeeze(0)
         attention_mask = attention_mask.squeeze(0)
-        
-        # Convert attention mask to boolean
         attention_mask = attention_mask.to(torch.bool)
-        
-        # Replace padding token in labels with -100 to ignore in loss computation
         labels = torch.where(attention_mask, labels, torch.tensor(-100))
         
         return {
-            'input_ids': input_ids,
-            'labels': labels,
-            'attention_mask': attention_mask
+            'input_ids': input_ids.pin_memory() if torch.cuda.is_available() else input_ids,
+            'labels': labels.pin_memory() if torch.cuda.is_available() else labels,
+            'attention_mask': attention_mask.pin_memory() if torch.cuda.is_available() else attention_mask
         }
     
-    # Tokenize the dataset without caching for streaming dataset
+    # Use DataLoader for better batching and parallelization
     tokenized_dataset = dataset.map(
         tokenize_function,
         remove_columns=dataset.column_names,
-        batched=True
+        batched=True,
+        num_proc=num_workers
     )
     
-    return tokenized_dataset
+    return DataLoader(
+        tokenized_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
 def train(
     model: nn.Module,
@@ -171,10 +172,10 @@ def train(
     gradient_accumulation_steps = config['gradient_accumulation_steps']
     total_loss = 0
     
-    progress_bar = tqdm(range(resume_from, config['max_steps']))
+    progress_bar = tqdm(total=config['max_steps'], initial=resume_from)
     
     try:
-        for step in range(resume_from, config['max_steps']):
+        while global_step < config['max_steps']:
             retry_count = 0
             while retry_count < config['max_retries']:
                 try:
@@ -183,20 +184,18 @@ def train(
                 except Exception as e:
                     retry_count += 1
                     if retry_count == config['max_retries']:
-                        # Save checkpoint before giving up
                         checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
                         torch.save({
                             'step': global_step,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict(),
-                            'loss': total_loss / (step + 1) if step > 0 else 0,
+                            'loss': total_loss / (global_step + 1) if global_step > 0 else 0,
                         }, checkpoint_path)
                         log_file.write(f"\nMaximum retries exceeded. Saved checkpoint to {checkpoint_path}\n")
                         log_file.flush()
                         raise Exception(f"Maximum retries ({config['max_retries']}) exceeded when fetching batch")
                     
-                    # Wait with exponential backoff
                     wait_time = config['retry_delay'] * (2 ** (retry_count - 1))
                     log_file.write(f"\nRetry {retry_count}/{config['max_retries']} after {wait_time}s. Error: {str(e)}\n")
                     log_file.flush()
@@ -261,7 +260,7 @@ def train(
             
             total_loss += loss.item()
             
-            if (step + 1) % gradient_accumulation_steps == 0:
+            if (global_step + 1) % gradient_accumulation_steps == 0:
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
                 
@@ -276,13 +275,18 @@ def train(
                 
                 global_step += 1
                 
-                avg_loss = total_loss * gradient_accumulation_steps / (step + 1)
+                avg_loss = total_loss * gradient_accumulation_steps / (global_step + 1)
                 progress_bar.set_postfix({
                     "loss": f"{avg_loss:.4f}",
                     "lr": f"{scheduler.get_last_lr()[0]:.6f}",
-                    "grad_norm": f"{grad_norm:.4f}"
+                    "grad_norm": f"{grad_norm:.4f}",
+                    "remaining": f"{config['max_steps'] - global_step - 1} steps"
                 })
                 progress_bar.update(1)
+                
+                if global_step >= config['max_steps']:
+                    log_file.write("\nReached maximum steps. Training complete.\n")
+                    break
                 
                 if global_step % 100 == 0:
                     log_message = (
@@ -339,267 +343,352 @@ def train(
                     test_generation(model, tokenizer, device, log_file)
                     log_file.flush()
 
+        # Final checkpoint save
+        checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_final.pt')
+        torch.save({
+            'step': global_step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': avg_loss,
+        }, checkpoint_path)
+        log_file.write(f"\nFinal checkpoint saved: {checkpoint_path}\n")
+        
+        return global_step >= config['max_steps']  # Return True if training completed
+
     except Exception as e:
         error_msg = f"\nTraining interrupted at step {global_step}: {str(e)}"
         log_file.write(error_msg + "\n")
         log_file.flush()
-        
-        # Ensure cleanup happens
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        raise
+        return False  # Return False if training was interrupted
     
     finally:
+        progress_bar.close()
         log_file.close()
         torch.cuda.empty_cache()
         gc.collect()
 
-def main():
-    # Cleanup function
-    def cleanup():
-        print("\nCleaning up resources...")
+def cleanup(signo=None, frame=None):
+    """Safe cleanup function that handles both normal exits and signals."""
+    print("\nCleaning up resources...")
+    try:
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Force garbage collection
         gc.collect()
-        torch.cuda.empty_cache()
+        
+        # Close any open files
+        try:
+            log_file.close()
+        except:
+            pass
+            
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+    finally:
+        # Ensure Python exits cleanly
+        if signo is not None:
+            sys.exit(0)
+
+def main():
+    global log_file  # Make log_file accessible to cleanup function
     
     # Register cleanup for normal exit and signals
     atexit.register(cleanup)
-    signal.signal(signal.SIGTERM, lambda signo, frame: cleanup())
-    signal.signal(signal.SIGINT, lambda signo, frame: cleanup())
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
     
     # Training configuration
     config = {
-        'batch_size': 4,              # Increased from 1
-        'gradient_accumulation_steps': 8,  # Reduced from 32
-        'learning_rate': 1e-4,        # Adjusted learning rate
-        'weight_decay': 0.01,         # Reduced weight decay
+        'batch_size': 16,              # Increased from 4 for better parallelization
+        'gradient_accumulation_steps': 4,  # Reduced from 8 for more frequent updates
+        'learning_rate': 2e-4,         # Slightly increased for faster convergence
+        'weight_decay': 0.01,
         'max_steps': 10000,
-        'warmup_steps': 500,          # Shorter warmup
+        'warmup_steps': 500,
         'save_steps': 1000,
         'seed': 42,
-        'max_grad_norm': 0.5,         # Reduced for stability
+        'max_grad_norm': 0.5,
         'resume_from': 0,
         'block_size': 512,
         'max_retries': 10,
         'retry_delay': 5,
-        'timeout': 30
+        'timeout': 30,
+        'num_workers': 4,              # Added for dataloader parallelization
+        'pin_memory': True,            # Added for faster data transfer to GPU
+        'prefetch_factor': 2,          # Added for data prefetching
     }
     
-    # Check for existing checkpoints
-    checkpoints = []
-    if os.path.exists('checkpoints'):
-        for f in os.listdir('checkpoints'):
-            try:
-                if f.startswith('model_step_') and f.endswith('.pt'):
-                    # Extract step number, handling both normal and interrupted checkpoints
-                    step_str = f.replace('model_step_', '').replace('.pt', '')
-                    step_str = step_str.split('_')[0]  # Remove '_interrupted' if present
-                    step_num = int(step_str)
-                    checkpoints.append((step_num, f))
-            except (ValueError, IndexError):
-                continue
+    # Performance optimizations
+    torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster matrix multiplications
+    torch.backends.cudnn.benchmark = True         # Enable cuDNN autotuner
+    torch.backends.cudnn.deterministic = False    # Disable deterministic mode for speed
+    torch.set_float32_matmul_precision('high')    # Use high precision for better speed/accuracy trade-off
     
-    # Sort by step number
-    checkpoints.sort(key=lambda x: x[0], reverse=True)
-    
-    if checkpoints:
-        latest_step, latest_file = checkpoints[0]
-        print(f"\nFound existing checkpoint at step {latest_step} ({latest_file})")
-        user_input = input("Would you like to resume from this checkpoint? (y/n): ")
-        if user_input.lower() == 'y':
-            config['resume_from'] = latest_step
-    
-    # Set random seed
-    torch.manual_seed(config['seed'])
-    np.random.seed(config['seed'])
-    
-    # Enable deterministic behavior
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nUsing device: {device}")
-    
-    # Initialize model config with adjusted parameters
-    model_config = DeepSeekConfig()
-    model_config.initializer_range = 0.01    # Reduced for better initialization
-    model_config.hidden_size = 384
-    model_config.intermediate_size = 1024
-    model_config.num_attention_heads = 6
-    model_config.num_key_value_heads = 2
-    model_config.num_hidden_layers = 12
-    model_config.max_position_embeddings = config['block_size']
-    
-    # Load tokenizer and set special tokens
-    print("\nLoading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
-    
-    # Ensure proper special token handling
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model_config.pad_token_id = tokenizer.pad_token_id
-    model_config.bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.cls_token_id
-    model_config.eos_token_id = tokenizer.eos_token_id
-    
-    print(f"Vocabulary size: {tokenizer.vocab_size}")
-    print(f"Padding token ID: {model_config.pad_token_id}")
-    print(f"BOS token ID: {model_config.bos_token_id}")
-    print(f"EOS token ID: {model_config.eos_token_id}")
-    
-    model_config.vocab_size = tokenizer.vocab_size
-    
-    # Initialize model
-    print("\nInitializing model...")
-    model = DeepSeekModel(model_config).to(device)
-    
-    # Better weight initialization
-    def init_weights(module):
-        if isinstance(module, nn.Linear):
-            # Use Kaiming initialization for linear layers
-            torch.nn.init.kaiming_normal_(module.weight, a=0, mode='fan_in', nonlinearity='linear')
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            # Use smaller range for embeddings
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
-        elif isinstance(module, nn.LayerNorm):
-            # Initialize LayerNorm
-            torch.nn.init.ones_(module.weight)
-            torch.nn.init.zeros_(module.bias)
-    
-    model.apply(init_weights)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Load dataset with streaming and improved configuration
-    print("\nLoading Cosmopedia dataset...")
     try:
-        # First try to authenticate with HuggingFace
-        token = input("\nPlease enter your HuggingFace token: ")
-        login(token=token, add_to_git_credential=False)
+        # Check for existing checkpoints
+        checkpoints = []
+        if os.path.exists('checkpoints'):
+            for f in os.listdir('checkpoints'):
+                try:
+                    if f.startswith('model_step_') and f.endswith('.pt'):
+                        # Extract step number, handling both normal and interrupted checkpoints
+                        step_str = f.replace('model_step_', '').replace('.pt', '')
+                        step_str = step_str.split('_')[0]  # Remove '_interrupted' if present
+                        step_num = int(step_str)
+                        checkpoints.append((step_num, f))
+                except (ValueError, IndexError):
+                    continue
         
-        # Configure dataset loading
-        from datasets.download.download_config import DownloadConfig
+        # Sort by step number
+        checkpoints.sort(key=lambda x: x[0], reverse=True)
         
-        # Create download config with retries
-        download_config = DownloadConfig(
-            token=token,
-            max_retries=config['max_retries'],
-            force_download=False
-        )
+        if checkpoints:
+            latest_step, latest_file = checkpoints[0]
+            print(f"\nFound existing checkpoint at step {latest_step} ({latest_file})")
+            user_input = input("Would you like to resume from this checkpoint? (y/n): ")
+            if user_input.lower() == 'y':
+                config['resume_from'] = latest_step
         
-        # Load dataset with streaming
-        dataset = load_dataset(
-            "HuggingFaceTB/cosmopedia",
-            "web_samples_v2",
-            split="train",
-            streaming=True,
-            download_config=download_config
-        )
-        print("Successfully loaded Cosmopedia dataset")
+        # Set random seed
+        torch.manual_seed(config['seed'])
+        np.random.seed(config['seed'])
         
-        # Create training dataset
-        print("\nPreparing dataset...")
-        train_dataset = create_dataloader(
-            dataset,
-            tokenizer,
-            batch_size=config['batch_size'],
-            block_size=config['block_size']
-        )
-        print("Dataset preparation completed")
+        # Enable deterministic behavior
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
         
-    except Exception as e:
-        print(f"\nError loading dataset: {str(e)}")
-        raise  # Re-raise the exception since we can't proceed without the dataset
-    
-    # Initialize optimizer with better settings
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config['learning_rate'],
-        weight_decay=config['weight_decay'],
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        fused=True
-    )
-    
-    # Use cosine schedule with warmup
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=config['warmup_steps'],
-        num_training_steps=config['max_steps']
-    )
-    
-    # Initialize gradient scaler with more conservative settings
-    scaler = GradScaler(
-        init_scale=2**10,            # Start with smaller scale
-        growth_factor=1.5,           # More conservative growth
-        backoff_factor=0.5,
-        growth_interval=100
-    )
-    
-    # Enable memory efficient attention if available
-    if hasattr(model, 'enable_mem_efficient_attention'):
-        model.enable_mem_efficient_attention()
-    
-    # Add gradient checkpointing for memory efficiency
-    if hasattr(model, 'gradient_checkpointing_enable'):
-        model.gradient_checkpointing_enable()
-    
-    # Enable flash attention if available
-    if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-        torch.backends.cuda.enable_flash_sdp(True)
-    
-    # Enable tensor cores for faster training
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    
-    # Set higher precision for gradients
-    torch.set_float32_matmul_precision('high')
-    
-    # Print training config
-    print("\nTraining configuration:")
-    for k, v in config.items():
-        print(f"{k}: {v}")
-    print("-" * 50)
-    
-    # Train the model with resume capability
-    print("\nStarting training...")
-    while True:
+        # Setup device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"\nUsing device: {device}")
+        
+        # Initialize model config with adjusted parameters
+        model_config = DeepSeekConfig()
+        model_config.initializer_range = 0.01    # Reduced for better initialization
+        model_config.hidden_size = 384
+        model_config.intermediate_size = 1024
+        model_config.num_attention_heads = 6
+        model_config.num_key_value_heads = 2
+        model_config.num_hidden_layers = 12
+        model_config.max_position_embeddings = config['block_size']
+        
+        # Load tokenizer and set special tokens
+        print("\nLoading tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+        
+        # Ensure proper special token handling
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model_config.pad_token_id = tokenizer.pad_token_id
+        model_config.bos_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.cls_token_id
+        model_config.eos_token_id = tokenizer.eos_token_id
+        
+        print(f"Vocabulary size: {tokenizer.vocab_size}")
+        print(f"Padding token ID: {model_config.pad_token_id}")
+        print(f"BOS token ID: {model_config.bos_token_id}")
+        print(f"EOS token ID: {model_config.eos_token_id}")
+        
+        model_config.vocab_size = tokenizer.vocab_size
+        
+        # Initialize model
+        print("\nInitializing model...")
+        model = DeepSeekModel(model_config).to(device)
+        
+        # Better weight initialization
+        def init_weights(module):
+            if isinstance(module, nn.Linear):
+                # Use Kaiming initialization for linear layers
+                torch.nn.init.kaiming_normal_(module.weight, a=0, mode='fan_in', nonlinearity='linear')
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                # Use smaller range for embeddings
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
+            elif isinstance(module, nn.LayerNorm):
+                # Initialize LayerNorm
+                torch.nn.init.ones_(module.weight)
+                torch.nn.init.zeros_(module.bias)
+        
+        model.apply(init_weights)
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+        
+        # Load dataset with streaming and improved configuration
+        print("\nLoading Cosmopedia dataset...")
         try:
-            train(
-                model=model,
-                dataset=train_dataset,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                device=device,
-                config=config,
-                save_dir='checkpoints',
-                resume_from=config['resume_from']
+            # First try to authenticate with HuggingFace
+            token = input("\nPlease enter your HuggingFace token: ")
+            login(token=token, add_to_git_credential=False)
+            
+            # Configure dataset loading
+            from datasets.download.download_config import DownloadConfig
+            
+            # Create download config with retries
+            download_config = DownloadConfig(
+                token=token,
+                max_retries=config['max_retries'],
+                force_download=False
             )
-            print("\nTraining completed successfully!")
-            break
+            
+            # Load dataset with streaming
+            dataset = load_dataset(
+                "HuggingFaceTB/cosmopedia",
+                "web_samples_v2",
+                split="train",
+                streaming=True,
+                download_config=download_config
+            )
+            print("Successfully loaded Cosmopedia dataset")
+            
+            # Create training dataset
+            print("\nPreparing dataset...")
+            train_dataset = create_dataloader(
+                dataset,
+                tokenizer,
+                batch_size=config['batch_size'],
+                block_size=config['block_size']
+            )
+            print("Dataset preparation completed")
+            
         except Exception as e:
-            print(f"\nTraining interrupted: {str(e)}")
-            user_input = input("Would you like to resume training? (y/n): ")
-            if user_input.lower() != 'y':
-                print("Training terminated by user.")
-                break
-            
-            # Find the latest checkpoint
-            checkpoints = sorted([
-                int(f.split('_')[1].split('.')[0])
-                for f in os.listdir('checkpoints')
-                if f.startswith('model_step_') and f.endswith('.pt')
-            ], reverse=True)
-            
-            if checkpoints:
-                config['resume_from'] = checkpoints[0]
-                print(f"Resuming from step {config['resume_from']}")
-            else:
-                print("No checkpoints found. Starting from beginning.")
-                config['resume_from'] = 0
+            print(f"\nError loading dataset: {str(e)}")
+            raise  # Re-raise the exception since we can't proceed without the dataset
+        
+        # Initialize optimizer with better settings
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config['learning_rate'],
+            weight_decay=config['weight_decay'],
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            fused=True,  # Use fused implementation
+        )
+        
+        # Use cosine schedule with warmup
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=config['warmup_steps'],
+            num_training_steps=config['max_steps']
+        )
+        
+        # Initialize gradient scaler with optimized settings
+        scaler = GradScaler(
+            init_scale=2**12,            # Increased from 2**10
+            growth_factor=2.0,           # More aggressive growth
+            backoff_factor=0.5,
+            growth_interval=100
+        )
+        
+        # Enable memory efficient attention if available
+        if hasattr(model, 'enable_mem_efficient_attention'):
+            model.enable_mem_efficient_attention()
+        
+        # Add gradient checkpointing for memory efficiency
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+        
+        # Enable flash attention if available
+        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            torch.backends.cuda.enable_flash_sdp(True)
+        
+        # Enable tensor cores for faster training
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Set higher precision for gradients
+        torch.set_float32_matmul_precision('high')
+        
+        # Print training config
+        print("\nTraining configuration:")
+        for k, v in config.items():
+            print(f"{k}: {v}")
+        print("-" * 50)
+        
+        # Train the model with resume capability
+        print("\nStarting training...")
+        while True:
+            try:
+                training_completed = train(
+                    model=model,
+                    dataset=train_dataset,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    device=device,
+                    config=config,
+                    save_dir='checkpoints',
+                    resume_from=config['resume_from']
+                )
+                
+                if training_completed:
+                    print("\nTraining completed successfully!")
+                    break
+                else:
+                    print("\nTraining incomplete. Current step:", config['resume_from'])
+                    user_input = input("Would you like to resume training? (y/n): ")
+                    if user_input.lower() != 'y':
+                        print("Training terminated by user.")
+                        break
+                    
+                    # Find the latest checkpoint
+                    checkpoints = []
+                    if os.path.exists('checkpoints'):
+                        for f in os.listdir('checkpoints'):
+                            try:
+                                if f.startswith('model_step_') and f.endswith('.pt'):
+                                    step_str = f.replace('model_step_', '').replace('.pt', '')
+                                    step_str = step_str.split('_')[0]
+                                    step_num = int(step_str)
+                                    checkpoints.append((step_num, f))
+                            except (ValueError, IndexError):
+                                continue
+                    
+                    if checkpoints:
+                        latest_step = max(checkpoints, key=lambda x: x[0])[0]
+                        config['resume_from'] = latest_step
+                        print(f"Resuming from step {config['resume_from']}")
+                    else:
+                        print("No checkpoints found. Starting from beginning.")
+                        config['resume_from'] = 0
+
+            except Exception as e:
+                print(f"\nTraining interrupted: {str(e)}")
+                user_input = input("Would you like to resume training? (y/n): ")
+                if user_input.lower() != 'y':
+                    print("Training terminated by user.")
+                    break
+                
+                # Find the latest checkpoint
+                checkpoints = []
+                if os.path.exists('checkpoints'):
+                    for f in os.listdir('checkpoints'):
+                        try:
+                            if f.startswith('model_step_') and f.endswith('.pt'):
+                                step_str = f.replace('model_step_', '').replace('.pt', '')
+                                step_str = step_str.split('_')[0]
+                                step_num = int(step_str)
+                                checkpoints.append((step_num, f))
+                        except (ValueError, IndexError):
+                            continue
+                
+                if checkpoints:
+                    latest_step = max(checkpoints, key=lambda x: x[0])[0]
+                    config['resume_from'] = latest_step
+                    print(f"Resuming from step {config['resume_from']}")
+                else:
+                    print("No checkpoints found. Starting from beginning.")
+                    config['resume_from'] = 0
+
+    except Exception as e:
+        print(f"\nTraining interrupted: {str(e)}")
+        cleanup()  # Ensure cleanup happens even on exception
+        sys.exit(1)
+    
+    finally:
+        cleanup()  # Final cleanup
 
 if __name__ == '__main__':
     main() 
