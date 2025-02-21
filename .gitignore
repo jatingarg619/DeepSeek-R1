@@ -51,7 +51,7 @@ wandb/
 *.ckpt
 *.bin
 model_weights/
-logs/
+
 
 # Data
 data/
