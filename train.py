@@ -126,23 +126,15 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             'attention_mask': attention_mask
         }
     
-    # Map the dataset with the tokenization function
+    # For streaming datasets, we don't use DataLoader's batching
+    # Instead, we let the dataset handle the streaming and batching
     tokenized_dataset = dataset.map(
         tokenize_function,
         remove_columns=dataset.column_names,
         batched=True
-    )
+    ).with_format("torch")
     
-    # Create DataLoader with appropriate settings for streaming
-    dataloader = DataLoader(
-        tokenized_dataset,
-        batch_size=batch_size,
-        num_workers=0,  # Set to 0 for streaming datasets
-        pin_memory=True,
-        prefetch_factor=None  # Not used when num_workers=0
-    )
-    
-    return dataloader
+    return tokenized_dataset
 
 def train(
     model: nn.Module,
@@ -184,21 +176,53 @@ def train(
     log_file.write("\nStarting training loop...\n")
     
     try:
+        # Create initial dataset iterator
+        data_iterator = iter(dataset)
+        log_file.write("Created initial dataset iterator\n")
+        
         while global_step < config['max_steps']:
             log_file.write(f"\nProcessing step {global_step + 1}...\n")
             
+            # Try to get next batch with retries
+            batch = None
+            retry_count = 0
+            
+            while batch is None and retry_count < config['max_retries']:
+                try:
+                    batch = next(data_iterator)
+                    break
+                except StopIteration:
+                    # Reset iterator if we reach the end
+                    log_file.write("Reached end of dataset, creating new iterator\n")
+                    data_iterator = iter(dataset)
+                    retry_count += 1
+                except Exception as e:
+                    log_file.write(f"Error fetching batch: {str(e)}\n")
+                    retry_count += 1
+                    time.sleep(config['retry_delay'])
+            
+            if batch is None:
+                log_file.write("Failed to get batch after retries, saving checkpoint and exiting\n")
+                # Save interrupted checkpoint
+                checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
+                torch.save({
+                    'step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'loss': total_loss / (accumulated_steps if accumulated_steps > 0 else 1),
+                }, checkpoint_path)
+                return False
+            
+            # Process the batch
             try:
-                # Get batch from dataloader directly
-                batch = next(iter(dataset))
-                log_file.write("Successfully fetched batch\n")
-                
-                # Move batch to device and ensure correct shape
+                # Move batch to device
                 input_ids = batch['input_ids'].to(device)
                 labels = batch['labels'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 
                 # Log shapes for debugging
-                log_file.write(f"Input shapes - ids: {input_ids.shape}, labels: {labels.shape}, mask: {attention_mask.shape}\n")
+                log_file.write(f"Batch shapes - ids: {input_ids.shape}, labels: {labels.shape}, mask: {attention_mask.shape}\n")
                 
                 with autocast(device_type=device.type):
                     # Forward pass
@@ -265,14 +289,10 @@ def train(
                         log_file.write(f"Skipping step due to invalid loss: {loss.item()}\n")
                         optimizer.zero_grad()
                 
-            except StopIteration:
-                log_file.write("\nReached end of dataset, creating new iterator...\n")
-                continue
-                
             except Exception as e:
-                log_file.write(f"\nError during training step: {str(e)}\n")
+                log_file.write(f"Error processing batch: {str(e)}\n")
                 log_file.flush()
-                raise
+                continue
         
         log_file.write("\nTraining completed successfully!\n")
         return True
