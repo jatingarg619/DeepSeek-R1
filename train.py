@@ -94,98 +94,48 @@ def test_generation(model, tokenizer, device, log_file):
     log_file.write("\n" + "="*50 + "\n")
     log_file.flush()
 
-def create_dataloader(dataset, tokenizer, batch_size, block_size=2048):
-    """Create a robust data iterator with better error handling and batch management."""
-    
+def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
     def tokenize_function(examples):
-        try:
-            # Ensure text is a string
-            text = str(examples['text'])
-            
-            # Tokenize with safety checks
-            tokenized = tokenizer(
-                text,
-                truncation=True,
-                max_length=block_size,
-                padding='max_length',
-                return_tensors='pt'
-            )
-            
-            # Get tensors and ensure they're on CPU
-            input_ids = tokenized['input_ids'].squeeze(0)
-            attention_mask = tokenized['attention_mask'].squeeze(0)
-            
-            # Create labels by shifting input_ids
-            labels = input_ids.clone()
-            labels = labels[1:]
-            input_ids = input_ids[:-1]
-            attention_mask = attention_mask[:-1]
-            
-            # Ensure all tensors have the same length
-            min_len = min(input_ids.size(0), labels.size(0), attention_mask.size(0))
-            input_ids = input_ids[:min_len]
-            labels = labels[:min_len]
-            attention_mask = attention_mask[:min_len]
-            
-            return {
-                'input_ids': input_ids,
-                'labels': labels,
-                'attention_mask': attention_mask
-            }
-        except Exception as e:
-            print(f"Error in tokenize_function: {str(e)}")
-            return None
+        # Use the text field from Cosmopedia dataset
+        text = examples['text']
+        tokenized = tokenizer(
+            text, 
+            truncation=True,
+            max_length=block_size,
+            padding='max_length',
+            return_tensors='pt'
+        )
+        
+        # Create input and target sequences
+        input_ids = tokenized['input_ids'][:, :-1]
+        labels = tokenized['input_ids'][:, 1:]
+        attention_mask = tokenized['attention_mask'][:, :-1]
+        
+        # Ensure proper dimensions
+        input_ids = input_ids.squeeze(0)
+        labels = labels.squeeze(0)
+        attention_mask = attention_mask.squeeze(0)
+        
+        # Convert attention mask to boolean
+        attention_mask = attention_mask.to(torch.bool)
+        
+        # Replace padding token in labels with -100 to ignore in loss computation
+        labels = torch.where(attention_mask, labels, torch.tensor(-100))
+        
+        return {
+            'input_ids': input_ids,
+            'labels': labels,
+            'attention_mask': attention_mask
+        }
     
-    def batch_sampler():
-        buffer = []
-        try:
-            for example in dataset:
-                try:
-                    # Process the example
-                    processed = tokenize_function(example)
-                    if processed is not None:
-                        buffer.append(processed)
-                    
-                    # When we have enough examples, yield a batch
-                    if len(buffer) == batch_size:
-                        # Stack tensors into a batch
-                        batch = {
-                            'input_ids': torch.stack([b['input_ids'] for b in buffer]),
-                            'labels': torch.stack([b['labels'] for b in buffer]),
-                            'attention_mask': torch.stack([b['attention_mask'] for b in buffer])
-                        }
-                        yield batch
-                        buffer = []
-                except Exception as e:
-                    print(f"Error processing example: {str(e)}")
-                    continue
-            
-            # Don't forget the last partial batch
-            if buffer:
-                try:
-                    batch = {
-                        'input_ids': torch.stack([b['input_ids'] for b in buffer]),
-                        'labels': torch.stack([b['labels'] for b in buffer]),
-                        'attention_mask': torch.stack([b['attention_mask'] for b in buffer])
-                    }
-                    yield batch
-                except Exception as e:
-                    print(f"Error processing final batch: {str(e)}")
-        except Exception as e:
-            print(f"Error in batch_sampler: {str(e)}")
-            # Yield any valid batches we have
-            if buffer:
-                try:
-                    batch = {
-                        'input_ids': torch.stack([b['input_ids'] for b in buffer]),
-                        'labels': torch.stack([b['labels'] for b in buffer]),
-                        'attention_mask': torch.stack([b['attention_mask'] for b in buffer])
-                    }
-                    yield batch
-                except Exception as e:
-                    print(f"Error processing emergency batch: {str(e)}")
+    # Tokenize the dataset without caching for streaming dataset
+    tokenized_dataset = dataset.map(
+        tokenize_function,
+        remove_columns=dataset.column_names,
+        batched=True
+    )
     
-    return batch_sampler()
+    return tokenized_dataset
 
 def train(
     model: nn.Module,
@@ -197,7 +147,8 @@ def train(
     device: torch.device,
     config: dict,
     save_dir: str = "checkpoints",
-    resume_from: int = 0
+    resume_from: int = 0,
+    download_config=None
 ):
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs("logs/training", exist_ok=True)
@@ -221,166 +172,205 @@ def train(
     global_step = resume_from
     gradient_accumulation_steps = config['gradient_accumulation_steps']
     total_loss = 0
-    accumulated_steps = 0
     
-    progress_bar = tqdm(total=config['max_steps'], initial=resume_from)
-    log_file.write("\nStarting training loop...\n")
-    
-    # Initialize data iterator
-    data_iterator = None
-    consecutive_errors = 0
-    max_consecutive_errors = 5
+    progress_bar = tqdm(range(resume_from, config['max_steps']))
     
     try:
-        while global_step < config['max_steps']:
-            try:
-                # Create or recreate iterator if needed
-                if data_iterator is None:
-                    data_iterator = dataset()
-                
-                # Get next batch with timeout
+        for step in range(resume_from, config['max_steps']):
+            retry_count = 0
+            while retry_count < config['max_retries']:
                 try:
-                    batch = next(data_iterator)
-                except StopIteration:
-                    log_file.write("\nReached end of dataset, creating new iterator\n")
-                    data_iterator = dataset()
-                    batch = next(data_iterator)
+                    try:
+                        batch = next(iter(dataset))
+                    except StopIteration:
+                        # Reset dataset iterator
+                        print("\nRestarting dataset iteration...")
+                        log_file.write("\nRestarting dataset iteration...\n")
+                        dataset = create_dataloader(
+                            load_dataset(
+                                "HuggingFaceTB/cosmopedia",
+                                "web_samples_v2",
+                                split="train",
+                                streaming=True,
+                                download_config=download_config
+                            ),
+                            tokenizer,
+                            batch_size=config['batch_size'],
+                            block_size=config['block_size']
+                        )
+                        batch = next(iter(dataset))
+                    break
                 except Exception as e:
-                    log_file.write(f"\nError getting batch: {str(e)}\n")
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        raise Exception(f"Too many consecutive errors ({max_consecutive_errors})")
-                    time.sleep(1)  # Brief pause before retry
+                    retry_count += 1
+                    if retry_count == config['max_retries']:
+                        # Save checkpoint before giving up
+                        checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_interrupted.pt')
+                        torch.save({
+                            'step': global_step,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'loss': total_loss / (step + 1) if step > 0 else 0,
+                        }, checkpoint_path)
+                        log_file.write(f"\nMaximum retries exceeded. Saved checkpoint to {checkpoint_path}\n")
+                        log_file.flush()
+                        raise Exception(f"Maximum retries ({config['max_retries']}) exceeded when fetching batch")
+                    
+                    # Wait with exponential backoff
+                    wait_time = config['retry_delay'] * (2 ** (retry_count - 1))
+                    log_file.write(f"\nRetry {retry_count}/{config['max_retries']} after {wait_time}s. Error: {str(e)}\n")
+                    log_file.flush()
+                    time.sleep(wait_time)
+            
+            input_ids = batch['input_ids'].unsqueeze(0).to(device)
+            labels = batch['labels'].unsqueeze(0).to(device)
+            attention_mask = batch['attention_mask'].unsqueeze(0).to(device)
+            
+            with autocast(device_type=device.type):
+                logits = model(input_ids, attention_mask)
+                
+                if torch.isinf(logits).any():
                     continue
                 
-                # Reset error counter on successful batch
-                consecutive_errors = 0
-                
-                # Process batch
                 try:
-                    # Move batch to device
-                    input_ids = batch['input_ids'].to(device)
-                    labels = batch['labels'].to(device)
-                    attention_mask = batch['attention_mask'].to(device)
-                    
-                    # Verify tensor shapes
-                    if input_ids.size(0) != config['batch_size'] or input_ids.size(1) != config['block_size'] - 1:
-                        log_file.write(f"\nUnexpected batch shape: {input_ids.shape}\n")
-                        continue
-                    
-                    with autocast(device_type=device.type):
-                        # Forward pass
-                        logits = model(input_ids, attention_mask)
-                        
-                        # Calculate loss
-                        loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
-                        loss = loss / gradient_accumulation_steps
-                        
-                        if not torch.isnan(loss).any() and not torch.isinf(loss).any():
-                            # Backward pass
-                            scaler.scale(loss).backward()
-                            
-                            total_loss += loss.item()
-                            accumulated_steps += 1
-                            
-                            if accumulated_steps % gradient_accumulation_steps == 0:
-                                # Optimizer step
-                                scaler.unscale_(optimizer)
-                                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
-                                
-                                if not torch.isnan(grad_norm):
-                                    scaler.step(optimizer)
-                                    scaler.update()
-                                    scheduler.step()
-                                    optimizer.zero_grad()
-                                    
-                                    global_step += 1
-                                    
-                                    # Update progress
-                                    avg_loss = total_loss / accumulated_steps
-                                    progress_bar.set_postfix({
-                                        "loss": f"{avg_loss:.4f}",
-                                        "lr": f"{scheduler.get_last_lr()[0]:.6f}",
-                                        "grad_norm": f"{grad_norm:.4f}"
-                                    })
-                                    progress_bar.update(1)
-                                    
-                                    # Logging
-                                    if global_step % 10 == 0:
-                                        log_file.write(
-                                            f"\nStep {global_step} stats:\n"
-                                            f"Average Loss: {avg_loss:.4f}\n"
-                                            f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
-                                            f"Gradient Norm: {grad_norm:.4f}\n"
-                                        )
-                                        log_file.flush()
-                                    
-                                    # Save checkpoint if needed
-                                    if global_step % 100 == 0:
-                                        checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
-                                        torch.save({
-                                            'step': global_step,
-                                            'model_state_dict': model.state_dict(),
-                                            'optimizer_state_dict': optimizer.state_dict(),
-                                            'scheduler_state_dict': scheduler.state_dict(),
-                                            'loss': avg_loss,
-                                        }, checkpoint_path)
-                                        log_file.write(f"\nSaved checkpoint: {checkpoint_path}\n")
-                                        log_file.flush()
-                                        
-                                        # Delete old checkpoint
-                                        prev_step = global_step - 100
-                                        if prev_step > 0:
-                                            prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
-                                            if os.path.exists(prev_checkpoint):
-                                                os.remove(prev_checkpoint)
-                                                log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
-                        else:
-                            log_file.write(f"\nSkipping step due to invalid loss: {loss.item()}\n")
-                            optimizer.zero_grad()
-                            
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        if hasattr(torch.cuda, 'empty_cache'):
-                            torch.cuda.empty_cache()
-                        log_file.write(f"\nCUDA out of memory: {str(e)}\n")
-                        continue
-                    raise e
-                    
-            except Exception as e:
-                log_file.write(f"\nError in training loop: {str(e)}\n")
-                log_file.flush()
+                    loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
+                except RuntimeError:
+                    continue
                 
-                # Save emergency checkpoint
-                emergency_checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}_emergency.pt')
-                try:
+                if torch.isnan(loss).any():
+                    continue
+                
+                if hasattr(model, 'layers') and hasattr(model.layers[0], 'moe'):
+                    expert_counts = torch.zeros(model.config.num_experts, device=device)
+                    hidden_states = model.embed_tokens(input_ids)
+                    
+                    for layer in model.layers:
+                        router_logits = layer.moe.gate(hidden_states)
+                        if torch.isnan(router_logits).any():
+                            continue
+                            
+                        router_probs = torch.softmax(router_logits, dim=-1)
+                        if torch.isnan(router_probs).any():
+                            continue
+                            
+                        expert_counts += router_probs.sum(dim=(0, 1))
+                    
+                    target_count = input_ids.size(0) * input_ids.size(1) / model.config.num_experts
+                    balance_loss = torch.mean((expert_counts - target_count).pow(2))
+                    aux_loss = 0.01 * balance_loss
+                    
+                    if not torch.isnan(aux_loss).any():
+                        loss += aux_loss
+                
+                loss = loss / gradient_accumulation_steps
+            
+            if torch.isnan(loss).any():
+                continue
+            
+            scaler.scale(loss).backward()
+            
+            valid_gradients = True
+            for name, param in model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    valid_gradients = False
+                    break
+            
+            if not valid_gradients:
+                optimizer.zero_grad()
+                continue
+            
+            total_loss += loss.item()
+            
+            if (step + 1) % gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['max_grad_norm'])
+                
+                if torch.isnan(grad_norm):
+                    optimizer.zero_grad()
+                    continue
+                
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+                
+                global_step += 1
+                
+                avg_loss = total_loss * gradient_accumulation_steps / (step + 1)
+                progress_bar.set_postfix({
+                    "loss": f"{avg_loss:.4f}",
+                    "lr": f"{scheduler.get_last_lr()[0]:.6f}",
+                    "grad_norm": f"{grad_norm:.4f}"
+                })
+                progress_bar.update(1)
+                
+                if global_step % 100 == 0:
+                    log_message = (
+                        f"\nStep {global_step}\n"
+                        f"Average Loss: {avg_loss:.4f}\n"
+                        f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n"
+                        f"Gradient Norm: {grad_norm:.4f}\n"
+                        + "-" * 50
+                    )
+                    log_file.write(log_message + "\n")
+                    log_file.flush()
+                    
+                    # Save checkpoint every 100 steps
+                    # Delete previous checkpoint if it exists
+                    prev_step = global_step - 100
+                    if prev_step > 0:
+                        prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
+                        if os.path.exists(prev_checkpoint):
+                            os.remove(prev_checkpoint)
+                            log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
+                    
+                    # Save new checkpoint
+                    checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
                     torch.save({
                         'step': global_step,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
-                        'loss': total_loss / (accumulated_steps if accumulated_steps > 0 else 1),
-                    }, emergency_checkpoint_path)
-                    log_file.write(f"\nSaved emergency checkpoint: {emergency_checkpoint_path}\n")
-                except Exception as save_error:
-                    log_file.write(f"\nFailed to save emergency checkpoint: {str(save_error)}\n")
+                        'loss': avg_loss,
+                    }, checkpoint_path)
+                    log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
+                    test_generation(model, tokenizer, device, log_file)
+                    log_file.flush()
                 
-                # Reset iterator
-                data_iterator = None
-                time.sleep(1)  # Brief pause before continuing
-                continue
-        
-        log_file.write("\nTraining completed successfully!\n")
-        return True
-        
+                if global_step % config['save_steps'] == 0:
+                    # Delete previous checkpoint if it exists
+                    prev_step = global_step - config['save_steps']
+                    if prev_step > 0:
+                        prev_checkpoint = os.path.join(save_dir, f'model_step_{prev_step}.pt')
+                        if os.path.exists(prev_checkpoint):
+                            os.remove(prev_checkpoint)
+                            log_file.write(f"\nDeleted previous checkpoint: {prev_checkpoint}\n")
+                    
+                    # Save new checkpoint
+                    checkpoint_path = os.path.join(save_dir, f'model_step_{global_step}.pt')
+                    torch.save({
+                        'step': global_step,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'loss': avg_loss,
+                    }, checkpoint_path)
+                    log_file.write(f"\nCheckpoint saved: {checkpoint_path}\n")
+                    test_generation(model, tokenizer, device, log_file)
+                    log_file.flush()
+
     except Exception as e:
-        error_msg = f"\nTraining interrupted: {str(e)}"
+        error_msg = f"\nTraining interrupted at step {global_step}: {str(e)}"
         log_file.write(error_msg + "\n")
         log_file.flush()
-        return False
         
+        # Ensure cleanup happens
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        raise
+    
     finally:
-        progress_bar.close()
         log_file.close()
         torch.cuda.empty_cache()
         gc.collect()
@@ -420,9 +410,9 @@ def main():
     
     # Training configuration
     config = {
-        'batch_size': 16,              # Increased from 4 for better parallelization
-        'gradient_accumulation_steps': 4,  # Reduced from 8 for more frequent updates
-        'learning_rate': 2e-4,         # Slightly increased for faster convergence
+        'batch_size': 4,
+        'gradient_accumulation_steps': 8,
+        'learning_rate': 1e-4,
         'weight_decay': 0.01,
         'max_steps': 10000,
         'warmup_steps': 500,
@@ -433,17 +423,8 @@ def main():
         'block_size': 512,
         'max_retries': 10,
         'retry_delay': 5,
-        'timeout': 30,
-        'num_workers': 4,              # Added for dataloader parallelization
-        'pin_memory': True,            # Added for faster data transfer to GPU
-        'prefetch_factor': 2,          # Added for data prefetching
+        'timeout': 30
     }
-    
-    # Performance optimizations
-    torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster matrix multiplications
-    torch.backends.cudnn.benchmark = True         # Enable cuDNN autotuner
-    torch.backends.cudnn.deterministic = False    # Disable deterministic mode for speed
-    torch.set_float32_matmul_precision('high')    # Use high precision for better speed/accuracy trade-off
     
     try:
         # Check for existing checkpoints
@@ -580,7 +561,7 @@ def main():
             weight_decay=config['weight_decay'],
             betas=(0.9, 0.95),
             eps=1e-8,
-            fused=True,  # Use fused implementation
+            fused=True
         )
         
         # Use cosine schedule with warmup
@@ -590,10 +571,10 @@ def main():
             num_training_steps=config['max_steps']
         )
         
-        # Initialize gradient scaler with optimized settings
+        # Initialize gradient scaler with more conservative settings
         scaler = GradScaler(
-            init_scale=2**12,            # Increased from 2**10
-            growth_factor=2.0,           # More aggressive growth
+            init_scale=2**10,            # Start with smaller scale
+            growth_factor=1.5,           # More conservative growth
             backoff_factor=0.5,
             growth_interval=100
         )
@@ -627,7 +608,7 @@ def main():
         print("\nStarting training...")
         while True:
             try:
-                training_completed = train(
+                train(
                     model=model,
                     dataset=train_dataset,
                     tokenizer=tokenizer,
@@ -637,40 +618,11 @@ def main():
                     device=device,
                     config=config,
                     save_dir='checkpoints',
-                    resume_from=config['resume_from']
+                    resume_from=config['resume_from'],
+                    download_config=download_config
                 )
-                
-                if training_completed:
-                    print("\nTraining completed successfully!")
-                    break
-                else:
-                    print("\nTraining incomplete. Current step:", config['resume_from'])
-                    user_input = input("Would you like to resume training? (y/n): ")
-                    if user_input.lower() != 'y':
-                        print("Training terminated by user.")
-                        break
-                    
-                    # Find the latest checkpoint
-                    checkpoints = []
-                    if os.path.exists('checkpoints'):
-                        for f in os.listdir('checkpoints'):
-                            try:
-                                if f.startswith('model_step_') and f.endswith('.pt'):
-                                    step_str = f.replace('model_step_', '').replace('.pt', '')
-                                    step_str = step_str.split('_')[0]
-                                    step_num = int(step_str)
-                                    checkpoints.append((step_num, f))
-                            except (ValueError, IndexError):
-                                continue
-                    
-                    if checkpoints:
-                        latest_step = max(checkpoints, key=lambda x: x[0])[0]
-                        config['resume_from'] = latest_step
-                        print(f"Resuming from step {config['resume_from']}")
-                    else:
-                        print("No checkpoints found. Starting from beginning.")
-                        config['resume_from'] = 0
-
+                print("\nTraining completed successfully!")
+                break
             except Exception as e:
                 print(f"\nTraining interrupted: {str(e)}")
                 user_input = input("Would you like to resume training? (y/n): ")
@@ -679,21 +631,14 @@ def main():
                     break
                 
                 # Find the latest checkpoint
-                checkpoints = []
-                if os.path.exists('checkpoints'):
-                    for f in os.listdir('checkpoints'):
-                        try:
-                            if f.startswith('model_step_') and f.endswith('.pt'):
-                                step_str = f.replace('model_step_', '').replace('.pt', '')
-                                step_str = step_str.split('_')[0]
-                                step_num = int(step_str)
-                                checkpoints.append((step_num, f))
-                        except (ValueError, IndexError):
-                            continue
+                checkpoints = sorted([
+                    int(f.split('_')[1].split('.')[0])
+                    for f in os.listdir('checkpoints')
+                    if f.startswith('model_step_') and f.endswith('.pt')
+                ], reverse=True)
                 
                 if checkpoints:
-                    latest_step = max(checkpoints, key=lambda x: x[0])[0]
-                    config['resume_from'] = latest_step
+                    config['resume_from'] = checkpoints[0]
                     print(f"Resuming from step {config['resume_from']}")
                 else:
                     print("No checkpoints found. Starting from beginning.")
