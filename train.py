@@ -96,10 +96,12 @@ def test_generation(model, tokenizer, device, log_file):
 
 def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_workers=4):
     def tokenize_function(examples):
-        # Use the text field from Cosmopedia dataset
-        text = examples['text']
+        # Process multiple examples at once
+        texts = examples['text']
+        
+        # Tokenize all texts at once
         tokenized = tokenizer(
-            text, 
+            texts, 
             truncation=True,
             max_length=block_size,
             padding='max_length',
@@ -110,11 +112,6 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
         input_ids = tokenized['input_ids'][:, :-1]
         labels = tokenized['input_ids'][:, 1:]
         attention_mask = tokenized['attention_mask'][:, :-1]
-        
-        # Ensure proper dimensions
-        input_ids = input_ids.squeeze(0)
-        labels = labels.squeeze(0)
-        attention_mask = attention_mask.squeeze(0)
         
         # Convert attention mask to boolean
         attention_mask = attention_mask.to(torch.bool)
@@ -128,14 +125,15 @@ def create_dataloader(dataset, tokenizer, batch_size, block_size=2048, num_worke
             'attention_mask': attention_mask
         }
     
-    # Tokenize the dataset without caching for streaming dataset
-    tokenized_dataset = dataset.map(
+    # Enable faster data loading
+    dataset = dataset.map(
         tokenize_function,
         remove_columns=dataset.column_names,
-        batched=True
+        batched=True,
+        batch_size=batch_size * 2  # Process more examples at once
     )
     
-    return tokenized_dataset
+    return dataset
 
 def train(
     model: nn.Module,
@@ -150,6 +148,11 @@ def train(
     resume_from: int = 0,
     download_config=None
 ):
+    # Enable CUDA optimizations
+    torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
+    torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for faster training
+    torch.backends.cudnn.allow_tf32 = True
+    
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs("logs/training", exist_ok=True)
     
@@ -410,8 +413,8 @@ def main():
     
     # Training configuration
     config = {
-        'batch_size': 4,
-        'gradient_accumulation_steps': 8,
+        'batch_size': 16,              # Increased from 4 for better GPU utilization
+        'gradient_accumulation_steps': 4,  # Reduced from 8 since we increased batch size
         'learning_rate': 1e-4,
         'weight_decay': 0.01,
         'max_steps': 10000,
@@ -423,7 +426,10 @@ def main():
         'block_size': 512,
         'max_retries': 10,
         'retry_delay': 5,
-        'timeout': 30
+        'timeout': 30,
+        'num_workers': 4,              # Added for parallel data loading
+        'prefetch_factor': 2,          # Added for data prefetching
+        'pin_memory': True             # Added for faster data transfer to GPU
     }
     
     try:
@@ -590,10 +596,6 @@ def main():
         # Enable flash attention if available
         if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
             torch.backends.cuda.enable_flash_sdp(True)
-        
-        # Enable tensor cores for faster training
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
         
         # Set higher precision for gradients
         torch.set_float32_matmul_precision('high')
