@@ -1,0 +1,260 @@
+
+==================================================
+New Training Run
+==================================================
+Training started at: 2025-02-21 08:11:33
+
+Training Configuration:
+batch_size: 16
+gradient_accumulation_steps: 4
+learning_rate: 0.0001
+weight_decay: 0.01
+max_steps: 10000
+warmup_steps: 500
+save_steps: 500
+seed: 42
+max_grad_norm: 0.5
+resume_from: 4100
+block_size: 512
+max_retries: 10
+retry_delay: 5
+timeout: 30
+num_workers: 4
+prefetch_factor: 2
+pin_memory: True
+==================================================
+
+Resuming training from step 4100
+Loaded checkpoint from checkpoints/model_step_4100.pt
+Previous loss: 3208.9323776855467
+
+Step 4200 (Time: 2025-02-21 08:24:23)
+Average Loss: 438.8283
+Learning Rate: 0.000067
+Gradient Norm: 0.0019
+Time per step: 1.87s
+--------------------------------------------------
+
+Step 4300 (Time: 2025-02-21 08:37:06)
+Average Loss: 806.0113
+Learning Rate: 0.000065
+Gradient Norm: 0.0041
+Time per step: 1.88s
+--------------------------------------------------
+
+Step 4400 (Time: 2025-02-21 08:49:55)
+Average Loss: 1117.7703
+Learning Rate: 0.000064
+Gradient Norm: 0.0026
+Time per step: 1.89s
+--------------------------------------------------
+
+Step 4500 (Time: 2025-02-21 09:02:45)
+Average Loss: 1385.7737
+Learning Rate: 0.000062
+Gradient Norm: 0.0015
+Time per step: 1.88s
+--------------------------------------------------
+
+Checkpoint saved: checkpoints/model_step_4500.pt
+
+==================================================
+Test Generations
+==================================================
+
+Prompt 1: Explain the concept of quantum entanglement in simple terms:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Explain the concept of quantum entanglement in simple terms:ala outlines Definingparse MV substance Evil subgenre underest bulimiaWed subgenre expr �illaryQR PatrolQR bulimia SOFTWARE critical substanceaguar Evil mM Unknown DefiningDEBUG”? bulimiacb � Andrews enhancementSV上 bullies Journalism VallQR battlefield mM unanim benefitedQR motivaterails neonatalillary sixty PCR Noise privileges PCR Jeremy MV unanimillarymxLEG sixty rallies escapQRSV meterRD possession dyeingSNillarysize truillary mM mutantsIds Noise briefing上 Bridges synthesize Defining �上 contiguous Vallpee mutants Vallillary rallies feathered synthesize cursed � grabbed sixtySV Achievement
+--------------------------------------------------
+
+Prompt 2: Write a short story about a time traveler who:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Write a short story about a time traveler who: vitamin fantasyinter plentiful JournalismEmotional sixty underest Journalism fencing contiguous gently heartfeltSN mM Definingonomy PCR companionship heartfeltillaryevery上size unanimsize underest Journalism underest sixtyillary edibleranging sixtyyan feathered enhancement meterisi shown contiguous fencing Certification PCR principle sineDim Uttar sixty mMSV workload Jeremy edible motivatesizeSV Achievement NoiseAvailable Bridges amalg � meter Journalism Defining motivate feathered Noiseillary Journalism sixty Array mammography Fascinating”? feathered feathered Noise captivesaguar � Unknown mM Noise mM contiguous � AndrewsDEBUG synthesize feathered MV heartfelt edible sixty ki Bere Noise unanim
+--------------------------------------------------
+
+Prompt 3: Here's a recipe for a delicious vegetarian dish:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Here's a recipe for a delicious vegetarian dish: Solution Defining BridgesBurn PCRAponomyQR Defining subgenre heartfelt ki exoplan PCR apparel dutySV AchievementQR metersize Definingillary apparelound sixtyQR PCR Achievement sixtyDEBUG bulimiaiters mM� Bots miR glimps Definingisi bulimia bullies edible”? heartfeltinter sixty unanimanim � Rest miR Jeremyimport Defining dyeing pragmat workloadBetter feathered heartfeltyanyanillary benchmarkWell � sixty sixty glimpssize Fall mM truaguar Achievement heartfelt mutants sixty �VIIIillary meter federalismsizeexact####ermost Uttar trav briefing chlorineimport � mMTYPE unanim motivate iT Jeremy
+--------------------------------------------------
+
+Prompt 4: The most fascinating discovery in astronomy was:
+Debug: Input shape: torch.Size([1, 8])
+Debug: Output shape: torch.Size([1, 108])
+Generated text:
+The most fascinating discovery in astronomy was:semanim warm diversified outlines JournalismanimQR � meter underest Achievementevery mM rallies sixty ralliesaguaraguar mM ralliesIdsIds Achievement ali Unknown sixtyBurn Defining mM NoiseAutom Treatments hire Solutionfounded pragmat dams heartfelt Achievement pragmatQR meter Definingestockermost Unknown bedding Array edible neonatal PCRTYPErangingQRpleasantWell hire Allahsize escap escap pastries People edible Noise sixtyrails exoplan Settingsillary Disorders sixtySN diversifiedsizeillary”? Jeremy####AutomAutomanim battlefield � dutyIdsillary edible federalism Lithuania meter implicitly Noise captives sixty MVillaryIdsIds
+--------------------------------------------------
+
+Prompt 5: The future of artificial intelligence will likely involve:
+Debug: Input shape: torch.Size([1, 9])
+Debug: Output shape: torch.Size([1, 109])
+Generated text:
+The future of artificial intelligence will likely involve: MVQR its Journalism Achievement sixtyAgent MVmenopausal commented conven featheredSV miR comet Strange Array Array Chatillary ki battlefieldQR PCRsizeEmotionalQR pastries evangelical expr上 divide MViters meterQR Achievement sixtyaguar underestkeley amalg shown Certification principle amalg Defining mammography Unknown substance feathered dyeing miRDimformal PCR glimpsWell Strange SOFTWAREown benchmark SOFTWARE expr � Vall kiIdsSV mM sixty feathered Arche Jeremy Bridges heartfelt starches bulimia federalism Andrews Defining mM Defining Bridges federalismQR mM feathered bulimia Defining Andrews � Bere上 feathered miR briefing bullies motivate bullies
+--------------------------------------------------
+
+==================================================
+
+Step 4600 (Time: 2025-02-21 09:15:54)
+Average Loss: 1618.6291
+Learning Rate: 0.000061
+Gradient Norm: 0.0019
+Time per step: 1.88s
+--------------------------------------------------
+
+Step 4700 (Time: 2025-02-21 09:29:11)
+Average Loss: 1822.8254
+Learning Rate: 0.000059
+Gradient Norm: 0.0019
+Time per step: 2.03s
+--------------------------------------------------
+
+Step 4800 (Time: 2025-02-21 09:42:01)
+Average Loss: 2003.3468
+Learning Rate: 0.000057
+Gradient Norm: 0.0015
+Time per step: 1.92s
+--------------------------------------------------
+
+Step 4900 (Time: 2025-02-21 09:54:58)
+Average Loss: 2164.0850
+Learning Rate: 0.000056
+Gradient Norm: 0.0018
+Time per step: 1.88s
+--------------------------------------------------
+
+Step 5000 (Time: 2025-02-21 10:07:40)
+Average Loss: 2308.1231
+Learning Rate: 0.000054
+Gradient Norm: 0.0015
+Time per step: 1.90s
+--------------------------------------------------
+
+Deleted previous checkpoint: checkpoints/model_step_4500.pt
+
+Checkpoint saved: checkpoints/model_step_5000.pt
+
+==================================================
+Test Generations
+==================================================
+
+Prompt 1: Explain the concept of quantum entanglement in simple terms:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Explain the concept of quantum entanglement in simple terms: meterME Achievement phytochemical Patrol exoplancolorpee bullies trash ki herbivores Andrewsbasename Andrewsiration Paradox indic bullies Defining Patrol MV preterm� rentedonomy foundations Kak duty Defining divide Cultures Uttar Extension heartfelt herbivores edibleisipee Journalism pretermphabet Strange mM heartfelt bullies stop chlorineSN benchmark HIV � Extension basal Noise � Noise exoplankeley Kak herbivores sixty People excav foundationssites edible Officer Noise featheredEmotional Defining Officer Vall heartfelt featheredirationNOWconverter Jeremypreserved macroeconomic Noise heartfelt heartfeltRDulated People ki feathered underest rallies chlorineWeather NGO workloadsitesHaySV workload
+--------------------------------------------------
+
+Prompt 2: Write a short story about a time traveler who:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Write a short story about a time traveler who:Emotional Achievementonomy underestillary Patrol Noise JournalismSVevolution mM mM pragmat Oxfordsites workload travevery Achievementsites vowelSN bullies Paradox heartfelt Patrol exoplan PCR � sixty Andrews edible divide Journalism Jeremy mM glimps hire Achievement Noisekeley Noiseicip bullies lakh workloadVIIIsites AUTHEmotionalEmotionalsites sixty Certificationillary hiresize benchmark Fall interfering Ill SemiticBurn MV Fall Kak Solution HIV executions Paradox sixty interfering heartfelt edibleonomy HIV �irationthelthel chlorine workloadphaseBurn Jeremy sixty shedding heartfelt ki virulence conven interfering chlorine mM JournalismSVevery heartfelt Strait Array
+--------------------------------------------------
+
+Prompt 3: Here's a recipe for a delicious vegetarian dish:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Here's a recipe for a delicious vegetarian dish:Burn exoplanDim Journalism outlines mMkeley conven principleonomy feathered Kak Patrolbasename feathered Patrol speak Andrews sixtyevery divideExplanationiewevery � Noise heartfelt underest Defining Jeremy conven vaccinatedBurn conveneveryillary Peopleonomy mM SolutionkeleyhumanirationAngle heartfelt miR possession Certification reflectiveEmotional meterEmotional Fall workload � Officerphase Fall workload Ill chlorine hireSV Achievement �onomy sixty conven foundations Solution sixty heartfeltSN meter unanim Bes Ba preterm trav sixty ki Defining unanim interferingmxiodiversitypee edible hireME possession heartfelt People#### chlorine edible上 curry foundations �
+--------------------------------------------------
+
+Prompt 4: The most fascinating discovery in astronomy was:
+Debug: Input shape: torch.Size([1, 8])
+Debug: Output shape: torch.Size([1, 108])
+Generated text:
+The most fascinating discovery in astronomy was: Certification Andrewsonomy workloadBurn Achievementbasenamesitessb principleirationarf mM mM ki Bos Paradoxsites heartfelt SOFTWARE Defining Patrol Noise Achievement childcarepee conven substance conven sixty Kak Cultures featheredBurn feathered mM sixty OfficerExplanation �sites reflective Journalism Noise Noiseescenceillary exoplan Take preterm Certificationranging possessionsites heartfeltsites heartfelt Jeremy Fall Officer herbivores mMenfranch PCR bullies Andrews rallies mM sixtyAngle heartfelt erect heartfelt underest#### foundations workload sixty Empressiewiration sixty Andrewspee enterpriseIdsevery divide Hack exoplan stop trav edible walks mM feathered MV Achievement underestkeley
+--------------------------------------------------
+
+Prompt 5: The future of artificial intelligence will likely involve:
+Debug: Input shape: torch.Size([1, 9])
+Debug: Output shape: torch.Size([1, 109])
+Generated text:
+The future of artificial intelligence will likely involve: leapsdehydeME bullieseveryher Defining bullies � �####ulatedsites excav Paradox Defining mM conven Kak sewing Jeremy loan Kak exoplan Activitypee Journalismsites Uttar duty Achievementyan mM conveniration Kak foundationsILLEmotional PCR heartfeltsites dividemx feathered sixtyeveryQRillarypeeEmotionalillary heartfelt dividevaluedevery Strange Officer sixty exoplan bullies principle Paradox MV sixty slums ExtensionSV sixty Jeremyescence sixty hire unanim Andrews Journalism Achievement AndrewsAutom Noise Certificationiosync Andrews Andrews workloadohn heartfelt People conven stop Achievement ralliesonomyaguar conven sixty bulliesSN Certification parameters
+--------------------------------------------------
+
+==================================================
+
+Step 5100 (Time: 2025-02-21 10:20:53)
+Average Loss: 2437.9353
+Learning Rate: 0.000052
+Gradient Norm: 0.0016
+Time per step: 1.96s
+--------------------------------------------------
+
+Step 5200 (Time: 2025-02-21 10:33:40)
+Average Loss: 2555.5298
+Learning Rate: 0.000051
+Gradient Norm: 0.0015
+Time per step: 1.92s
+--------------------------------------------------
+
+Step 5300 (Time: 2025-02-21 10:46:28)
+Average Loss: 2662.5540
+Learning Rate: 0.000049
+Gradient Norm: 0.0016
+Time per step: 1.98s
+--------------------------------------------------
+
+Step 5400 (Time: 2025-02-21 10:59:10)
+Average Loss: 2760.3719
+Learning Rate: 0.000048
+Gradient Norm: 0.0019
+Time per step: 2.02s
+--------------------------------------------------
+
+Step 5500 (Time: 2025-02-21 11:11:56)
+Average Loss: 2850.1223
+Learning Rate: 0.000046
+Gradient Norm: 0.0012
+Time per step: 1.88s
+--------------------------------------------------
+
+Deleted previous checkpoint: checkpoints/model_step_5000.pt
+
+Checkpoint saved: checkpoints/model_step_5500.pt
+
+==================================================
+Test Generations
+==================================================
+
+Prompt 1: Explain the concept of quantum entanglement in simple terms:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Explain the concept of quantum entanglement in simple terms: rented []) its Noise motivateQR MV Journalism conven edible JournalismNOWkeley substancePhD Noise conven HIVṣ sixty workload conven PCR preprocessing speak heartfeltaguar Journalism PCR Endangered MV feathered CulturesQRNOW bulliesisi reflective workload Strait edible underest MV sixty Noise Noise Take Certification HIVMedic sixty privilegesBurnbasename heartfelt unanim hirebasenamekeley delegatesEmotionalillary mM Certification trash heartfeltsizeulated herbivores Fall ki sixty Defining Kak rented heartfeltBurn Uttar edibleDim mM Andrews Isle � dutyVIII Noiseresolved Journalism Allah lakh Noise chlorine Hof Noise workload heartfelt workload preprocessing Sin
+--------------------------------------------------
+
+Prompt 2: Write a short story about a time traveler who:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Write a short story about a time traveler who: Noise Noise amenablesize jealousy sixty proposals mM rented BuzzPhD edible AchievementSV widespread respond Esktheoryevery JournalismPhD Liversize heartfelt amenable interfering MVposed Defining heartfelt Journalism Culturesonomy feathered Take surprising HIV rentedsites workload Defining Settings Noise Take workload Noise sixtyillaryulatedMedicillarySV workload derivatives chlorine Certification heel workload sixty Take Journalism mM Noise jealousy heartfelt Noisesizeopterssites mM miR Noise duty MV MV rentedBurn sixtyalle chlorineillaryotyp motivate divide sixty chlorine workloadDrugillary Journalism heel demand civil OxfordPres Journalism sixty heartfelt Noise MV
+--------------------------------------------------
+
+Prompt 3: Here's a recipe for a delicious vegetarian dish:
+Debug: Input shape: torch.Size([1, 10])
+Debug: Output shape: torch.Size([1, 110])
+Generated text:
+Here's a recipe for a delicious vegetarian dish:Emotional Noise Achievement Noise benchmark Cultures Patrol conven Noiseevery sixty�EmotionalGuard sixty Journalism MVaguar Herbert iTPanEmotional divideonomy sixty feathered Culturessites ki Noise featherederge ki Noiseopters cockpit sixty Noisesites unanim Noisesize conven featheredillarysites PCRalle FascinatingQR HIV underest heartfelt mM Achievement Noiseicip conven underest heartfelt heartfelt dre hungSV HIV Noise Audubonaguarsites Noiseillary miR ki heel heartfelt feathered workload chlorine Take Noise PCRsizeyellowresolved heartfelt edible Patrol heartfelt dividesize civil HIV上 sixtyillary featheredieweverykeley Patrol
+--------------------------------------------------
+
+Prompt 4: The most fascinating discovery in astronomy was:
+Debug: Input shape: torch.Size([1, 8])
+Debug: Output shape: torch.Size([1, 108])
+Generated text:
+The most fascinating discovery in astronomy was: basal showneverysizeAfrica mM� sine sixty Kak conven mM herbivores”? Journalism suscept edible kibasename divide heartfeltExplanation MV gainonomyisors urgently Noise privileges evangelicalPhD}/{yanyan heartfelt feathered sixty feathered sixty sixty workload � Noise heartfelt MV Rest mM heartfeltyan HIV sixty rented regularization workload mM Noisesites Paradox sixty Arche Arche Noise workload NoiseAvailablesbphase Fascinating HIV feathered sixtyQR workloadsites Journalism Mead excav Mead workload MV edible UttarNOW rentedohn sixty metap”? Noise � heartfeltresolvedresolvedSV conven Journalism Later workloadDrug Noise
+--------------------------------------------------
+
+Prompt 5: The future of artificial intelligence will likely involve:
+Debug: Input shape: torch.Size([1, 9])
+Debug: Output shape: torch.Size([1, 109])
+Generated text:
+The future of artificial intelligence will likely involve:dehyde outlinesatable ki Fascinating edible its underestonomyeveryevery governsillary Noise Culturesonomy Paradoxeverysolution Extension Patrol vowelsites duty Array evangelical substance interfering MVNOW Culturesyan MV sixty workloadiration CertificationDrug arbitration”? Mead Mead workload reflective Noise�Emotional ki Achievementoreg rentedyan heartfelt privileges mMran glimps CertificationBurn edibleSV kibasename featheredillaryEmotional � ki Noise rallies Patrol”? PCRphase rented sixty Cypri conven sixty CypriSV conven Noisephase sixtyillary Noise Noiseiosyncunting edible mM Sin Paradoxfoundedresolved mM chlorine rented meter
+--------------------------------------------------
+
+==================================================
